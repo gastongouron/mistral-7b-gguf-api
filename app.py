@@ -344,9 +344,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 )
                 
                 # Envoyer la réponse
-                await websocket.send_json({
+                response_json = {
                     "type": "completion",
-                    "request_id": msg.request_id, 
                     "choices": [{
                         "message": {
                             "role": "assistant",
@@ -356,16 +355,27 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     }],
                     "usage": response['usage'],
                     "time_ms": round(elapsed)
-                })
+                }
+                
+                # Ajouter request_id s'il existe
+                if "request_id" in data:
+                    response_json["request_id"] = data["request_id"]
+                
+                await websocket.send_json(response_json)
                 
                 print(f"[WS] Réponse envoyée en {elapsed:.0f}ms")
                 
             except Exception as e:
                 print(f"[WS] Erreur: {str(e)}")
-                await websocket.send_json({
+                error_response = {
                     "type": "error",
                     "error": str(e)
-                })
+                }
+                # Ajouter request_id s'il existe même en cas d'erreur
+                if "request_id" in data:
+                    error_response["request_id"] = data["request_id"]
+                    
+                await websocket.send_json(error_response)
     
     except WebSocketDisconnect:
         print("[WS] Client déconnecté")
