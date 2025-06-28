@@ -8,6 +8,7 @@ import time
 import uuid
 import json
 import re
+import logging
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -19,6 +20,12 @@ from llama_cpp import Llama
 MODEL_PATH = "/app/models/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
 MODEL_URL = "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")  # Peut être défini via variable d'environnement
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 # Sécurité
 security = HTTPBearer()
@@ -138,16 +145,21 @@ def format_messages_mistral(messages: List[Message]) -> str:
 
 def clean_and_parse_json(text: str) -> Optional[Dict]:
     """Nettoyer et parser du JSON potentiellement mal formaté"""
-    # Enlever les timestamps et préfixes
+    # Amélioration du nettoyage JSON
+    # Enlever les timestamps et préfixes  
     text = re.sub(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \[.*?\] => ', '', text.strip())
     text = re.sub(r'^.*?Extracted content:\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'^.*?:\s*(?=\{)', '', text)  # Enlever tout avant le premier {
     
-    # Trouver le JSON dans le texte
-    json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
-    if not json_match:
+    # Extraire uniquement le JSON
+    json_start = text.find('{')
+    json_end = text.rfind('}')
+    
+    if json_start != -1 and json_end != -1 and json_end > json_start:
+        json_text = text[json_start:json_end+1]
+    else:
+        # Pas de JSON trouvé
         return None
-    
-    json_text = json_match.group(0)
     
     # Corriger les problèmes courants
     # Remplacer les underscores échappés
@@ -232,13 +244,19 @@ async def chat_completions(request: ChatCompletionRequest):
     if llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
+    # ⏱️ DÉBUT MESURE PERFORMANCE
+    start_time = time.time()
+    
     try:
         # Formater les messages
         prompt = format_messages_mistral(request.messages)
         
-        # Si on demande du JSON, ajouter des instructions
+        # Si on demande du JSON, ajouter des instructions FORTES
         if request.response_format and request.response_format.get("type") == "json_object":
-            prompt += "\n[INST] Réponds uniquement avec un objet JSON valide, sans texte supplémentaire. [/INST]"
+            prompt += "\n[INST] CRITICAL: Réponds UNIQUEMENT avec un objet JSON valide. PAS de texte avant ou après. PAS d'explication. SEULEMENT le JSON entre { et }. [/INST]"
+        
+        # ⏱️ DÉBUT GÉNÉRATION
+        generation_start = time.time()
         
         # Générer la réponse
         response = llm(
@@ -250,11 +268,20 @@ async def chat_completions(request: ChatCompletionRequest):
             echo=False
         )
         
+        # ⏱️ FIN GÉNÉRATION
+        generation_time = (time.time() - generation_start) * 1000  # en ms
+        
         # Extraire le texte généré
         generated_text = response['choices'][0]['text'].strip()
         
         # S'assurer que c'est du JSON valide si demandé
         generated_text = ensure_json_response(generated_text, request.response_format)
+        
+        # ⏱️ TEMPS TOTAL
+        total_time = (time.time() - start_time) * 1000  # en ms
+        
+        # 📊 LOG PERFORMANCE
+        logging.info(f"[PERF] Total: {total_time:.0f}ms | Generation: {generation_time:.0f}ms | Tokens: {len(response['usage']['completion_tokens'])} | Format: {request.response_format}")
         
         # Créer la réponse au format OpenAI/Claude
         chat_response = ChatCompletionResponse(
