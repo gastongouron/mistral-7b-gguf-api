@@ -2,6 +2,7 @@
 """
 API FastAPI pour servir le modèle Mistral 7B GGUF avec llama-cpp-python
 Avec authentification Bearer et format de réponse Claude-like
++ ENDPOINT WEBSOCKET
 """
 import os
 import time
@@ -9,7 +10,7 @@ import uuid
 import json
 import re
 import logging
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
@@ -19,7 +20,7 @@ from llama_cpp import Llama
 # Configuration
 MODEL_PATH = "/app/models/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
 MODEL_URL = "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
-API_TOKEN = os.getenv("API_TOKEN", "supersecret")  # Peut être défini via variable d'environnement
+API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 
 # Configuration du logging
 logging.basicConfig(
@@ -30,7 +31,7 @@ logging.basicConfig(
 # Sécurité
 security = HTTPBearer()
 
-# Modèles Pydantic
+# Modèles Pydantic (identiques)
 class Message(BaseModel):
     role: str
     content: str
@@ -43,7 +44,7 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = 0.95
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
-    response_format: Optional[Dict[str, str]] = None  # Pour forcer JSON
+    response_format: Optional[Dict[str, str]] = None
 
 class Usage(BaseModel):
     prompt_tokens: int
@@ -110,17 +111,15 @@ def load_model():
     """Charger le modèle GGUF"""
     global llm
     
-    # Vérifier/télécharger le modèle
     download_model_if_needed()
     
     print(f"Chargement du modèle depuis {MODEL_PATH}...")
     
-    # Paramètres pour llama-cpp-python
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=4096,  # Taille du contexte
-        n_threads=8,  # Nombre de threads CPU
-        n_gpu_layers=35,  # Nombre de couches sur GPU
+        n_ctx=4096,
+        n_threads=8,
+        n_gpu_layers=35,
         verbose=True
     )
     
@@ -145,31 +144,23 @@ def format_messages_mistral(messages: List[Message]) -> str:
 
 def clean_and_parse_json(text: str) -> Optional[Dict]:
     """Nettoyer et parser du JSON potentiellement mal formaté"""
-    # Amélioration du nettoyage JSON
-    # Enlever les timestamps et préfixes  
     text = re.sub(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \[.*?\] => ', '', text.strip())
     text = re.sub(r'^.*?Extracted content:\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'^.*?:\s*(?=\{)', '', text)  # Enlever tout avant le premier {
+    text = re.sub(r'^.*?:\s*(?=\{)', '', text)
     
-    # Extraire uniquement le JSON
     json_start = text.find('{')
     json_end = text.rfind('}')
     
     if json_start != -1 and json_end != -1 and json_end > json_start:
         json_text = text[json_start:json_end+1]
     else:
-        # Pas de JSON trouvé
         return None
     
-    # Corriger les problèmes courants
-    # Remplacer les underscores échappés
     json_text = json_text.replace(r'\_', '_')
     
-    # Essayer de parser
     try:
         return json.loads(json_text)
     except json.JSONDecodeError:
-        # Essayer de corriger les guillemets simples
         json_text = json_text.replace("'", '"')
         try:
             return json.loads(json_text)
@@ -179,12 +170,10 @@ def clean_and_parse_json(text: str) -> Optional[Dict]:
 def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> str:
     """S'assurer que la réponse est du JSON valide si demandé"""
     if request_format and request_format.get("type") == "json_object":
-        # Essayer de parser et nettoyer le JSON
         parsed = clean_and_parse_json(text)
         if parsed:
             return json.dumps(parsed, ensure_ascii=False)
         else:
-            # Si on ne peut pas parser, créer une structure JSON basique
             return json.dumps({
                 "response": text,
                 "error": "Could not parse as valid JSON"
@@ -198,13 +187,14 @@ async def startup_event():
 
 @app.get("/")
 async def root():
-    """Point d'entrée de l'API - pas d'auth nécessaire"""
+    """Point d'entrée de l'API"""
     return {
         "message": "Mistral 7B GGUF API",
         "status": "running",
         "model": "mistral-7b-instruct-v0.1.Q4_K_M.gguf",
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
+            "/ws": "WebSocket - Chat endpoint (requires token in query)",
             "/v1/models": "GET - List available models",
             "/health": "GET - Health check"
         }
@@ -212,7 +202,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Vérifier l'état de l'API - pas d'auth nécessaire"""
+    """Vérifier l'état de l'API"""
     return {
         "status": "healthy",
         "model_loaded": llm is not None,
@@ -244,21 +234,12 @@ async def chat_completions(request: ChatCompletionRequest):
     if llm is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    # ⏱️ DÉBUT MESURE PERFORMANCE
-    start_time = time.time()
-    
     try:
-        # Formater les messages
         prompt = format_messages_mistral(request.messages)
         
-        # Si on demande du JSON, ajouter des instructions FORTES
         if request.response_format and request.response_format.get("type") == "json_object":
             prompt += "\n[INST] CRITICAL: Réponds UNIQUEMENT avec un objet JSON valide. PAS de texte avant ou après. PAS d'explication. SEULEMENT le JSON entre { et }. [/INST]"
         
-        # ⏱️ DÉBUT GÉNÉRATION
-        generation_start = time.time()
-        
-        # Générer la réponse
         response = llm(
             prompt,
             max_tokens=request.max_tokens,
@@ -268,22 +249,9 @@ async def chat_completions(request: ChatCompletionRequest):
             echo=False
         )
         
-        # ⏱️ FIN GÉNÉRATION
-        generation_time = (time.time() - generation_start) * 1000  # en ms
-        
-        # Extraire le texte généré
         generated_text = response['choices'][0]['text'].strip()
-        
-        # S'assurer que c'est du JSON valide si demandé
         generated_text = ensure_json_response(generated_text, request.response_format)
         
-        # ⏱️ TEMPS TOTAL
-        total_time = (time.time() - start_time) * 1000  # en ms
-        
-        # 📊 LOG PERFORMANCE
-        logging.info(f"[PERF] Total: {total_time:.0f}ms | Generation: {generation_time:.0f}ms | Tokens: {response['usage']['completion_tokens']} | Format: {request.response_format}")
-        
-        # Créer la réponse au format OpenAI/Claude
         chat_response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             created=int(time.time()),
@@ -308,13 +276,98 @@ async def chat_completions(request: ChatCompletionRequest):
         print(f"Erreur lors de la génération: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/v1/chat/completions")
-async def chat_completions_info():
-    """Information sur l'endpoint de chat"""
-    return {
-        "error": "This endpoint only supports POST requests",
-        "hint": "Send a POST request with a JSON body containing 'messages' array and Bearer token in header"
-    }
+# ====== NOUVEAU: ENDPOINT WEBSOCKET ======
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
+    """Endpoint WebSocket pour les complétions de chat"""
+    
+    # Vérifier le token
+    if token != API_TOKEN:
+        await websocket.close(code=1008, reason="Invalid token")
+        return
+    
+    await websocket.accept()
+    
+    # Envoyer un message de bienvenue
+    await websocket.send_json({
+        "type": "connection",
+        "status": "connected",
+        "model": "mistral-7b-gguf"
+    })
+    
+    try:
+        while True:
+            # Recevoir la requête
+            data = await websocket.receive_json()
+            
+            # Log
+            print(f"[WS] Requête reçue: {len(data.get('messages', []))} messages")
+            
+            # Vérifier que le modèle est chargé
+            if llm is None:
+                await websocket.send_json({
+                    "type": "error",
+                    "error": "Model not loaded"
+                })
+                continue
+            
+            # Traiter la requête
+            try:
+                # Convertir les messages en objets Message
+                messages = [Message(**msg) for msg in data.get("messages", [])]
+                prompt = format_messages_mistral(messages)
+                
+                # Ajouter instruction JSON si demandé
+                if data.get("response_format", {}).get("type") == "json_object":
+                    prompt += "\n[INST] CRITICAL: Réponds UNIQUEMENT avec un objet JSON valide. PAS de texte avant ou après. PAS d'explication. SEULEMENT le JSON entre { et }. [/INST]"
+                
+                # Générer
+                start_time = time.time()
+                
+                response = llm(
+                    prompt,
+                    max_tokens=data.get("max_tokens", 512),
+                    temperature=data.get("temperature", 0.7),
+                    top_p=data.get("top_p", 0.95),
+                    stop=data.get("stop", ["</s>", "[INST]"]),
+                    echo=False
+                )
+                
+                elapsed = (time.time() - start_time) * 1000
+                
+                # Extraire et nettoyer
+                generated_text = response['choices'][0]['text'].strip()
+                generated_text = ensure_json_response(
+                    generated_text, 
+                    data.get("response_format")
+                )
+                
+                # Envoyer la réponse
+                await websocket.send_json({
+                    "type": "completion",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": generated_text
+                        },
+                        "finish_reason": response['choices'][0]['finish_reason']
+                    }],
+                    "usage": response['usage'],
+                    "time_ms": round(elapsed)
+                })
+                
+                print(f"[WS] Réponse envoyée en {elapsed:.0f}ms")
+                
+            except Exception as e:
+                print(f"[WS] Erreur: {str(e)}")
+                await websocket.send_json({
+                    "type": "error",
+                    "error": str(e)
+                })
+    
+    except WebSocketDisconnect:
+        print("[WS] Client déconnecté")
 
 if __name__ == "__main__":
     import uvicorn

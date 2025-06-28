@@ -10,8 +10,8 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
 # Configuration
-API_URL = "https://opls0sp8kal7rd-8000.proxy.runpod.net"
-API_TOKEN = "supertoken"
+API_URL = "https://rhyx84x4k3pri9-8000.proxy.runpod.net"
+API_TOKEN = "supersecret"
 HEADERS = {
     "Authorization": f"Bearer {API_TOKEN}",
     "Content-Type": "application/json"
@@ -109,7 +109,7 @@ class VoxEngineTestSuite:
             {
                 "messages": [
                     {"role": "system", "content": "Tu es un ASSISTANT VOICEMAIL INTELLIGENT pour cabinet médical. Réponds UNIQUEMENT en JSON."},
-                    {"role": "user", "content": 'PATIENT: "j\'ai besoin d\'un détartrage"\nDétecte intention et action.\nJSON: {"intention": "medical_motif|off_topic|goodbye", "action": "ask_question|finalize", "medical_motif": "...", "urgency_detected": bool}'}
+                    {"role": "user", "content": 'PATIENT: "j\'ai besoin d\'un détartrage"\nC\'est un motif dentaire clair qui doit être finalisé immédiatement.\nRéponds avec cette structure: {"intention": "medical_motif", "action": "finalize", "medical_motif": "détartrage", "urgency_detected": false}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 150,
@@ -140,7 +140,7 @@ class VoxEngineTestSuite:
             "Intention: Hors-sujet (restaurant)",
             {
                 "messages": [
-                    {"role": "user", "content": 'PATIENT: "je veux réserver une table au restaurant"\nPAS médical donc off_topic obligatoire.\nJSON: {"intention": "off_topic", "reasoning": "..."}'}
+                    {"role": "user", "content": 'PATIENT: "je veux réserver une table au restaurant"\nCe n\'est PAS une demande médicale, donc l\'intention DOIT être "off_topic".\nStructure attendue: {"intention": "off_topic", "reasoning": "Demande non médicale"}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 100,
@@ -208,7 +208,7 @@ class VoxEngineTestSuite:
             "Formulaire: Nom épelé (G O U R O N)",
             {
                 "messages": [
-                    {"role": "user", "content": 'Extraire nom épelé: "G O U R O N"\nReconstituer le nom.\nJSON: {"is_valid": true, "extracted_value": "NOM_RECONSTITUÉ"}'}
+                    {"role": "user", "content": 'Le patient épelle son nom lettre par lettre: "G O U R O N"\nReconstitue ces lettres pour former le nom complet.\nLa réponse doit avoir cette structure: {"is_valid": true, "extracted_value": "GOURON"}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 100,
@@ -223,7 +223,7 @@ class VoxEngineTestSuite:
             "Formulaire: Date française (quinze mars quatre-vingt-huit)",
             {
                 "messages": [
-                    {"role": "user", "content": 'Convertir "quinze mars quatre-vingt-huit" en DD/MM/YYYY.\nJSON: {"is_valid": true, "extracted_value": "DD/MM/YYYY"}'}
+                    {"role": "user", "content": 'Convertis cette date française en format numérique: "quinze mars quatre-vingt-huit"\nQuinze = 15, mars = 03, quatre-vingt-huit = 1988\nLe résultat doit être: {"is_valid": true, "extracted_value": "15/03/1988"}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 100,
@@ -253,7 +253,7 @@ class VoxEngineTestSuite:
             "Formulaire: Praticien (Docteur Marcello)",
             {
                 "messages": [
-                    {"role": "user", "content": 'Extraire praticien: "C\'est le docteur Marcello"\nJSON: {"is_valid": true, "extracted_value": "Dr NOM"}'}
+                    {"role": "user", "content": 'Le patient dit: "C\'est le docteur Marcello"\nExtrais le nom complet du praticien.\nLa réponse doit être: {"is_valid": true, "extracted_value": "Dr Marcello"}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 100,
@@ -291,7 +291,7 @@ class VoxEngineTestSuite:
             "Catégorie: Administrative (certificat)",
             {
                 "messages": [
-                    {"role": "user", "content": 'Motif: "besoin d\'un certificat médical"\nJSON: {"category": "medical_certificate|administrative", "recap": "..."}'}
+                    {"role": "user", "content": 'Motif: "besoin d\'un certificat médical"\nChoisis UNE SEULE catégorie parmi: medical_certificate, administrative, appointment_create\nRéponds avec: {"category": "medical_certificate", "recap": "Demande de certificat médical"}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 150,
@@ -337,7 +337,7 @@ Analyse finale JSON: {"medical_motif": "...", "urgency_detected": bool, "final_c
             "Complexe: Gestion réponse inadéquate",
             {
                 "messages": [
-                    {"role": "user", "content": 'Question: "Votre date de naissance?"\nRéponse: "euh... bah..."\nExtraire ou marquer invalide.\nJSON: {"is_valid": bool, "extracted_value": "...", "explanation": "..."}'}
+                    {"role": "user", "content": 'Question posée: "Votre date de naissance?"\nRéponse du patient: "euh... bah..."\nC\'est une réponse inadéquate, impossible d\'extraire une date.\nRéponds: {"is_valid": false, "extracted_value": "", "explanation": "Réponse trop vague pour extraire une date"}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 100,

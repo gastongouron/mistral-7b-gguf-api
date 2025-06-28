@@ -6,7 +6,7 @@ import requests
 import json
 
 # Configuration
-API_URL = "https://opls0sp8kal7rd-8000.proxy.runpod.net"
+API_URL = "https://rhyx84x4k3pri9-8000.proxy.runpod.net"
 API_TOKEN = "supersecret"  # Ton token Bearer
 
 def test_health():
