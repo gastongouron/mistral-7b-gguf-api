@@ -1,19 +1,27 @@
 #!/usr/bin/env python3
 """
 API FastAPI pour servir le modèle Mistral 7B GGUF avec llama-cpp-python
+Avec authentification Bearer et format de réponse Claude-like
 """
 import os
 import time
 import uuid
-from fastapi import FastAPI, HTTPException
+import json
+import re
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from llama_cpp import Llama
 
 # Configuration
 MODEL_PATH = "/app/models/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
 MODEL_URL = "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+API_TOKEN = os.getenv("API_TOKEN", "supersecret")  # Peut être défini via variable d'environnement
+
+# Sécurité
+security = HTTPBearer()
 
 # Modèles Pydantic
 class Message(BaseModel):
@@ -28,20 +36,31 @@ class ChatCompletionRequest(BaseModel):
     top_p: Optional[float] = 0.95
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
+    response_format: Optional[Dict[str, str]] = None  # Pour forcer JSON
+
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class Choice(BaseModel):
+    index: int
+    message: Message
+    finish_reason: str
 
 class ChatCompletionResponse(BaseModel):
     id: str
     object: str = "chat.completion"
     created: int
     model: str
-    choices: List[Dict[str, Any]]
-    usage: Dict[str, int]
+    choices: List[Choice]
+    usage: Usage
 
 # Initialisation de l'application
 app = FastAPI(
     title="Mistral 7B GGUF API",
     version="1.0.0",
-    description="API FastAPI pour Mistral 7B avec llama-cpp-python"
+    description="API FastAPI pour Mistral 7B avec llama-cpp-python et authentification"
 )
 
 # Configuration CORS
@@ -55,6 +74,16 @@ app.add_middleware(
 
 # Variable globale pour le modèle
 llm = None
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Vérifier le token Bearer"""
+    if credentials.credentials != API_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
 
 def download_model_if_needed():
     """Télécharger le modèle s'il n'existe pas"""
@@ -84,7 +113,7 @@ def load_model():
         model_path=MODEL_PATH,
         n_ctx=4096,  # Taille du contexte
         n_threads=8,  # Nombre de threads CPU
-        n_gpu_layers=35,  # Nombre de couches sur GPU (ajuster selon la VRAM)
+        n_gpu_layers=35,  # Nombre de couches sur GPU
         verbose=True
     )
     
@@ -96,8 +125,6 @@ def format_messages_mistral(messages: List[Message]) -> str:
     
     for i, message in enumerate(messages):
         if message.role == "system":
-            # Mistral Instruct v0.1 n'a pas de rôle système dédié
-            # On l'ajoute comme première instruction utilisateur
             formatted += f"[INST] {message.content}\n"
         elif message.role == "user":
             if i == 0 or messages[i-1].role != "system":
@@ -109,6 +136,49 @@ def format_messages_mistral(messages: List[Message]) -> str:
     
     return formatted.strip()
 
+def clean_and_parse_json(text: str) -> Optional[Dict]:
+    """Nettoyer et parser du JSON potentiellement mal formaté"""
+    # Enlever les timestamps et préfixes
+    text = re.sub(r'^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+ \[.*?\] => ', '', text.strip())
+    text = re.sub(r'^.*?Extracted content:\s*', '', text, flags=re.IGNORECASE)
+    
+    # Trouver le JSON dans le texte
+    json_match = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if not json_match:
+        return None
+    
+    json_text = json_match.group(0)
+    
+    # Corriger les problèmes courants
+    # Remplacer les underscores échappés
+    json_text = json_text.replace(r'\_', '_')
+    
+    # Essayer de parser
+    try:
+        return json.loads(json_text)
+    except json.JSONDecodeError:
+        # Essayer de corriger les guillemets simples
+        json_text = json_text.replace("'", '"')
+        try:
+            return json.loads(json_text)
+        except:
+            return None
+
+def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> str:
+    """S'assurer que la réponse est du JSON valide si demandé"""
+    if request_format and request_format.get("type") == "json_object":
+        # Essayer de parser et nettoyer le JSON
+        parsed = clean_and_parse_json(text)
+        if parsed:
+            return json.dumps(parsed, ensure_ascii=False)
+        else:
+            # Si on ne peut pas parser, créer une structure JSON basique
+            return json.dumps({
+                "response": text,
+                "error": "Could not parse as valid JSON"
+            }, ensure_ascii=False)
+    return text
+
 @app.on_event("startup")
 async def startup_event():
     """Charger le modèle au démarrage"""
@@ -116,13 +186,13 @@ async def startup_event():
 
 @app.get("/")
 async def root():
-    """Point d'entrée de l'API"""
+    """Point d'entrée de l'API - pas d'auth nécessaire"""
     return {
         "message": "Mistral 7B GGUF API",
         "status": "running",
         "model": "mistral-7b-instruct-v0.1.Q4_K_M.gguf",
         "endpoints": {
-            "/v1/chat/completions": "POST - Chat completions endpoint",
+            "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
             "/v1/models": "GET - List available models",
             "/health": "GET - Health check"
         }
@@ -130,7 +200,7 @@ async def root():
 
 @app.get("/health")
 async def health_check():
-    """Vérifier l'état de l'API"""
+    """Vérifier l'état de l'API - pas d'auth nécessaire"""
     return {
         "status": "healthy",
         "model_loaded": llm is not None,
@@ -138,7 +208,7 @@ async def health_check():
         "model_exists": os.path.exists(MODEL_PATH)
     }
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(verify_token)])
 async def list_models():
     """Lister les modèles disponibles"""
     return {
@@ -156,7 +226,7 @@ async def list_models():
         ]
     }
 
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_token)])
 async def chat_completions(request: ChatCompletionRequest):
     """Endpoint compatible OpenAI pour les complétions de chat"""
     if llm is None:
@@ -165,6 +235,10 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         # Formater les messages
         prompt = format_messages_mistral(request.messages)
+        
+        # Si on demande du JSON, ajouter des instructions
+        if request.response_format and request.response_format.get("type") == "json_object":
+            prompt += "\n[INST] Réponds uniquement avec un objet JSON valide, sans texte supplémentaire. [/INST]"
         
         # Générer la réponse
         response = llm(
@@ -179,24 +253,26 @@ async def chat_completions(request: ChatCompletionRequest):
         # Extraire le texte généré
         generated_text = response['choices'][0]['text'].strip()
         
-        # Créer la réponse au format OpenAI
+        # S'assurer que c'est du JSON valide si demandé
+        generated_text = ensure_json_response(generated_text, request.response_format)
+        
+        # Créer la réponse au format OpenAI/Claude
         chat_response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             created=int(time.time()),
             model=request.model,
-            choices=[{
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": generated_text
-                },
-                "finish_reason": response['choices'][0]['finish_reason']
-            }],
-            usage={
-                "prompt_tokens": response['usage']['prompt_tokens'],
-                "completion_tokens": response['usage']['completion_tokens'],
-                "total_tokens": response['usage']['total_tokens']
-            }
+            choices=[
+                Choice(
+                    index=0,
+                    message=Message(role="assistant", content=generated_text),
+                    finish_reason=response['choices'][0]['finish_reason']
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=response['usage']['prompt_tokens'],
+                completion_tokens=response['usage']['completion_tokens'],
+                total_tokens=response['usage']['total_tokens']
+            )
         )
         
         return chat_response
@@ -210,7 +286,7 @@ async def chat_completions_info():
     """Information sur l'endpoint de chat"""
     return {
         "error": "This endpoint only supports POST requests",
-        "hint": "Send a POST request with a JSON body containing 'messages' array"
+        "hint": "Send a POST request with a JSON body containing 'messages' array and Bearer token in header"
     }
 
 if __name__ == "__main__":

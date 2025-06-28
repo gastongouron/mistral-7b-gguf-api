@@ -1,10 +1,8 @@
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.1.0-cudnn8-runtime-ubuntu22.04
 
 # Variables d'environnement
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
-ENV CMAKE_ARGS="-DLLAMA_CUBLAS=on"
-ENV FORCE_CMAKE=1
 
 # Installation des dépendances système
 RUN apt-get update && apt-get install -y \
@@ -13,8 +11,6 @@ RUN apt-get update && apt-get install -y \
     git \
     wget \
     curl \
-    build-essential \
-    cmake \
     && rm -rf /var/lib/apt/lists/*
 
 # Créer un lien symbolique pour python
@@ -23,8 +19,10 @@ RUN ln -s /usr/bin/python3.10 /usr/bin/python
 # Upgrade pip
 RUN pip install --upgrade pip
 
-# Installation de llama-cpp-python avec support CUDA
-RUN pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu118
+# Installation de llama-cpp-python pré-compilé pour CUDA 12.1
+# Version spécifique qui fonctionne bien avec CUDA
+RUN pip install llama-cpp-python==0.2.90 \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 
 # Installation des autres dépendances
 RUN pip install fastapi uvicorn[standard] pydantic httpx
