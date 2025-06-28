@@ -346,6 +346,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 # Envoyer la réponse
                 await websocket.send_json({
                     "type": "completion",
+                    "request_id": msg.request_id, 
                     "choices": [{
                         "message": {
                             "role": "assistant",

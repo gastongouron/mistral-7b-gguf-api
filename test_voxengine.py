@@ -223,7 +223,7 @@ class VoxEngineTestSuite:
             "Formulaire: Date française (quinze mars quatre-vingt-huit)",
             {
                 "messages": [
-                    {"role": "user", "content": 'Convertis cette date française en format numérique: "quinze mars quatre-vingt-huit"\nQuinze = 15, mars = 03, quatre-vingt-huit = 1988\nLe résultat doit être: {"is_valid": true, "extracted_value": "15/03/1988"}'}
+                    {"role": "user", "content": 'Convertis cette date française en format numérique: "quinze mars quatre-vingt-huit", le résultat doit être: {"is_valid": true, "extracted_value": "DD/MM/YYYY"}'}
                 ],
                 "temperature": 0.01,
                 "max_tokens": 100,
