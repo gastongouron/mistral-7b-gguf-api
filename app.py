@@ -281,7 +281,7 @@ async def chat_completions(request: ChatCompletionRequest):
         total_time = (time.time() - start_time) * 1000  # en ms
         
         # 📊 LOG PERFORMANCE
-        logging.info(f"[PERF] Total: {total_time:.0f}ms | Generation: {generation_time:.0f}ms | Tokens: {len(response['usage']['completion_tokens'])} | Format: {request.response_format}")
+        logging.info(f"[PERF] Total: {total_time:.0f}ms | Generation: {generation_time:.0f}ms | Tokens: {response['usage']['completion_tokens']} | Format: {request.response_format}")
         
         # Créer la réponse au format OpenAI/Claude
         chat_response = ChatCompletionResponse(
