@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-API FastAPI pour servir le modèle Mistral 7B GGUF avec llama-cpp-python
+API FastAPI pour servir le modèle Qwen2.5-14B GGUF avec llama-cpp-python
 Avec authentification Bearer et format de réponse Claude-like
 + ENDPOINT WEBSOCKET
 """
@@ -17,9 +17,9 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
 from llama_cpp import Llama
 
-# Configuration
-MODEL_PATH = "/app/models/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
-MODEL_URL = "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.1-GGUF/resolve/main/mistral-7b-instruct-v0.1.Q4_K_M.gguf"
+# Configuration - CHANGÉ ICI
+MODEL_PATH = "/app/models/qwen2.5-14b-instruct-q4_k_m.gguf"
+MODEL_URL = "https://huggingface.co/Qwen/Qwen2.5-14B-Instruct-GGUF/resolve/main/qwen2.5-14b-instruct-q4_k_m.gguf"
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 
 # Configuration du logging
@@ -37,7 +37,7 @@ class Message(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "mistral-7b-gguf"
+    model: str = "qwen2.5-14b-gguf"  # CHANGÉ ICI
     messages: List[Message]
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = 512
@@ -66,9 +66,9 @@ class ChatCompletionResponse(BaseModel):
 
 # Initialisation de l'application
 app = FastAPI(
-    title="Mistral 7B GGUF API",
+    title="Qwen2.5-14B GGUF API",  # CHANGÉ ICI
     version="1.0.0",
-    description="API FastAPI pour Mistral 7B avec llama-cpp-python et authentification"
+    description="API FastAPI pour Qwen2.5-14B avec llama-cpp-python et authentification"
 )
 
 # Configuration CORS
@@ -95,17 +95,11 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 
 def download_model_if_needed():
     """Télécharger le modèle s'il n'existe pas"""
+    # Note: Dans le Dockerfile, on télécharge déjà le modèle
+    # Cette fonction est gardée pour compatibilité
     if not os.path.exists(MODEL_PATH):
-        print(f"Modèle non trouvé. Téléchargement depuis {MODEL_URL}...")
-        os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
-        
-        import httpx
-        with httpx.stream("GET", MODEL_URL) as response:
-            response.raise_for_status()
-            with open(MODEL_PATH, "wb") as f:
-                for chunk in response.iter_bytes():
-                    f.write(chunk)
-        print("Téléchargement terminé!")
+        print(f"Modèle non trouvé à {MODEL_PATH}")
+        raise Exception("Le modèle doit être pré-téléchargé dans l'image Docker")
 
 def load_model():
     """Charger le modèle GGUF"""
@@ -115,32 +109,36 @@ def load_model():
     
     print(f"Chargement du modèle depuis {MODEL_PATH}...")
     
+    # Configuration adaptée pour Qwen2.5-14B
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=4096,
+        n_ctx=8192,  # Qwen supporte un contexte plus long
         n_threads=8,
-        n_gpu_layers=35,
+        n_gpu_layers=-1,  # Toutes les couches sur GPU
         verbose=True
     )
     
     print("Modèle chargé avec succès!")
 
-def format_messages_mistral(messages: List[Message]) -> str:
-    """Formater les messages pour Mistral Instruct"""
+def format_messages_qwen(messages: List[Message]) -> str:
+    """Formater les messages pour Qwen2.5 (format ChatML)"""
     formatted = ""
     
-    for i, message in enumerate(messages):
+    for message in messages:
         if message.role == "system":
-            formatted += f"[INST] {message.content}\n"
+            formatted += f"<|im_start|>system\n{message.content}<|im_end|>\n"
         elif message.role == "user":
-            if i == 0 or messages[i-1].role != "system":
-                formatted += f"[INST] {message.content} [/INST]"
-            else:
-                formatted += f"{message.content} [/INST]"
+            formatted += f"<|im_start|>user\n{message.content}<|im_end|>\n"
         elif message.role == "assistant":
-            formatted += f" {message.content}</s> "
+            formatted += f"<|im_start|>assistant\n{message.content}<|im_end|>\n"
     
-    return formatted.strip()
+    # Ajouter le début de la réponse de l'assistant
+    formatted += "<|im_start|>assistant\n"
+    
+    return formatted
+
+# Alias pour compatibilité
+format_messages_mistral = format_messages_qwen
 
 def clean_and_parse_json(text: str) -> Optional[Dict]:
     """Nettoyer et parser du JSON potentiellement mal formaté"""
@@ -189,9 +187,9 @@ async def startup_event():
 async def root():
     """Point d'entrée de l'API"""
     return {
-        "message": "Mistral 7B GGUF API",
+        "message": "Qwen2.5-14B GGUF API",
         "status": "running",
-        "model": "mistral-7b-instruct-v0.1.Q4_K_M.gguf",
+        "model": "qwen2.5-14b-instruct-q4_k_m.gguf",
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
             "/ws": "WebSocket - Chat endpoint (requires token in query)",
@@ -217,12 +215,12 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": "mistral-7b-gguf",
+                "id": "qwen2.5-14b-gguf",
                 "object": "model",
                 "created": int(time.time()),
-                "owned_by": "TheBloke",
+                "owned_by": "Qwen",
                 "permission": [],
-                "root": "mistral-7b-gguf",
+                "root": "qwen2.5-14b-gguf",
                 "parent": None
             }
         ]
@@ -235,17 +233,18 @@ async def chat_completions(request: ChatCompletionRequest):
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
-        prompt = format_messages_mistral(request.messages)
+        prompt = format_messages_qwen(request.messages)
         
         if request.response_format and request.response_format.get("type") == "json_object":
-            prompt += "\n[INST] CRITICAL: Réponds UNIQUEMENT avec un objet JSON valide. PAS de texte avant ou après. PAS d'explication. SEULEMENT le JSON entre { et }. [/INST]"
+            # Qwen comprend mieux les instructions JSON
+            prompt += "Please respond with valid JSON only. No explanations, just the JSON object.\n"
         
         response = llm(
             prompt,
             max_tokens=request.max_tokens,
             temperature=request.temperature,
             top_p=request.top_p,
-            stop=request.stop or ["</s>", "[INST]"],
+            stop=request.stop or ["<|im_end|>", "<|endoftext|>"],  # CHANGÉ ICI: stop tokens pour Qwen
             echo=False
         )
         
@@ -276,7 +275,7 @@ async def chat_completions(request: ChatCompletionRequest):
         print(f"Erreur lors de la génération: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-# ====== NOUVEAU: ENDPOINT WEBSOCKET ======
+# ====== ENDPOINT WEBSOCKET ======
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
@@ -293,7 +292,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     await websocket.send_json({
         "type": "connection",
         "status": "connected",
-        "model": "mistral-7b-gguf"
+        "model": "qwen2.5-14b-gguf"
     })
     
     try:
@@ -316,11 +315,11 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             try:
                 # Convertir les messages en objets Message
                 messages = [Message(**msg) for msg in data.get("messages", [])]
-                prompt = format_messages_mistral(messages)
+                prompt = format_messages_qwen(messages)
                 
                 # Ajouter instruction JSON si demandé
                 if data.get("response_format", {}).get("type") == "json_object":
-                    prompt += "\n[INST] CRITICAL: Réponds UNIQUEMENT avec un objet JSON valide. PAS de texte avant ou après. PAS d'explication. SEULEMENT le JSON entre { et }. [/INST]"
+                    prompt += "Please respond with valid JSON only. No explanations, just the JSON object.\n"
                 
                 # Générer
                 start_time = time.time()
@@ -330,7 +329,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     max_tokens=data.get("max_tokens", 512),
                     temperature=data.get("temperature", 0.7),
                     top_p=data.get("top_p", 0.95),
-                    stop=data.get("stop", ["</s>", "[INST]"]),
+                    stop=data.get("stop", ["<|im_end|>", "<|endoftext|>"]),  # CHANGÉ ICI
                     echo=False
                 )
                 
