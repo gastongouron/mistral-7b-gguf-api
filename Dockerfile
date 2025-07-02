@@ -24,9 +24,10 @@ RUN echo "Installing llama-cpp-python with CUDA support..." && \
     pip install llama-cpp-python==0.2.90 \
     --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cu121
 
-# Installation des autres dépendances
+# Installation des dépendances FastAPI et métriques
 RUN echo "Installing FastAPI and dependencies..." && \
-    pip install fastapi uvicorn[standard] pydantic httpx
+    pip install fastapi uvicorn[standard] pydantic httpx \
+    prometheus-client psutil pynvml
 
 # Créer le répertoire de travail
 WORKDIR /app
@@ -70,7 +71,8 @@ RUN echo "=== Docker image build completed ===" && \
     echo "Model: Gemma-2-9B-IT Q5_K_M" && \
     echo "Optimized for: JSON outputs, categorization, date extraction" && \
     echo "Location: /app/models/gemma-2-9b-it-Q5_K_M.gguf" && \
-    echo "API will be available on port 8000"
+    echo "API will be available on port 8000" && \
+    echo "Metrics available at /metrics endpoint"
 
 # Exposer le port
 EXPOSE 8000
@@ -79,4 +81,5 @@ EXPOSE 8000
 CMD echo "Starting Gemma-2-9B API server..." && \
     echo "Model loading may take 20-40 seconds..." && \
     echo "Optimized for categorization and JSON outputs" && \
+    echo "Metrics endpoint available at /metrics" && \
     uvicorn app:app --host 0.0.0.0 --port 8000
