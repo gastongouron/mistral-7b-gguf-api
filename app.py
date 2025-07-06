@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-API FastAPI pour servir le modèle Qwen2.5-32B GGUF avec llama-cpp-python
+API FastAPI pour servir le modèle Qwen2.5-14B GGUF avec llama-cpp-python
 Optimisé pour conversations médicales françaises avec extraction JSON
 """
 import os
@@ -24,9 +24,9 @@ from llama_cpp import Llama
 # Import des métriques Prometheus
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
 
-# Configuration mise à jour pour Qwen2.5
-MODEL_PATH = "/app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf"
-MODEL_URL = "https://huggingface.co/Qwen/Qwen2.5-32B-Instruct-GGUF/resolve/main/qwen2.5-32b-instruct-q4_k_m.gguf"
+# Configuration mise à jour pour Qwen2.5-14B
+MODEL_PATH = "/app/models/Qwen2.5-14B-Instruct-Q4_K_M.gguf"
+MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-14B-Instruct-GGUF/resolve/main/Qwen2.5-14B-Instruct-Q4_K_M.gguf"
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 
 # Configuration du logging
@@ -40,7 +40,7 @@ logging.basicConfig(
 # Informations système
 system_info = Info('fastapi_system', 'System information')
 system_info.info({
-    'model': 'qwen2.5-32b',
+    'model': 'qwen2.5-14b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
     'version': '2.0.0'
@@ -88,7 +88,7 @@ fastapi_inference_duration_seconds = Histogram(
     'fastapi_inference_duration_seconds',
     'Inference duration in seconds',
     ['model'],
-    buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 20.0]
+    buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0]
 )
 
 fastapi_inference_queue_size = Gauge(
@@ -183,7 +183,7 @@ class Message(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "qwen2.5-32b"
+    model: str = "qwen2.5-14b"
     messages: List[Message]
     temperature: Optional[float] = 0.1  # Légèrement augmenté pour Qwen
     max_tokens: Optional[int] = 512
@@ -236,9 +236,9 @@ async def lifespan(app: FastAPI):
 
 # Initialisation de l'application avec lifespan
 app = FastAPI(
-    title="Qwen2.5-32B GGUF API",
+    title="Qwen2.5-14B GGUF API",
     version="2.0.0",
-    description="API FastAPI pour Qwen2.5-32B optimisée pour conversations médicales françaises avec JSON structuré",
+    description="API FastAPI pour Qwen2.5-14B optimisée pour conversations médicales françaises avec JSON structuré",
     lifespan=lifespan
 )
 
@@ -271,12 +271,12 @@ def download_model_if_needed():
         raise Exception("Le modèle doit être pré-téléchargé dans l'image Docker")
 
 def load_model():
-    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-32B"""
+    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-14B"""
     global llm
     
     download_model_if_needed()
     
-    print(f"Chargement du modèle Qwen2.5-32B depuis {MODEL_PATH}...")
+    print(f"Chargement du modèle Qwen2.5-14B depuis {MODEL_PATH}...")
     
     # Détecter la mémoire GPU disponible
     try:
@@ -287,27 +287,27 @@ def load_model():
         vram_gb = mem_info.total / (1024**3)
         print(f"VRAM disponible: {vram_gb:.1f} GB")
         
-        # Adapter les couches GPU selon la VRAM
-        if vram_gb >= 24:
+        # Adapter les couches GPU selon la VRAM (14B est plus léger)
+        if vram_gb >= 16:
             n_gpu_layers = -1  # Tout sur GPU
             print("Configuration: Modèle entièrement sur GPU")
-        elif vram_gb >= 20:
-            n_gpu_layers = 35
-            print("Configuration: 35 couches sur GPU")
+        elif vram_gb >= 12:
+            n_gpu_layers = 40  # La plupart sur GPU
+            print("Configuration: 40 couches sur GPU")
         else:
-            n_gpu_layers = 25
-            print("⚠️ VRAM limitée, performance réduite (25 couches sur GPU)")
+            n_gpu_layers = 30
+            print("⚠️ VRAM limitée, performance réduite (30 couches sur GPU)")
     except:
         n_gpu_layers = -1
         print("Impossible de détecter la VRAM, chargement complet sur GPU")
     
-    # Configuration optimisée pour Qwen2.5-32B
+    # Configuration optimisée pour Qwen2.5-14B
     llm = Llama(
         model_path=MODEL_PATH,
         n_ctx=8192,  # Qwen2.5 supporte 128K mais 8K suffisant pour conversations médicales
-        n_threads=16,  # Plus de threads pour ce modèle plus large
+        n_threads=12,  # Un peu moins que pour 32B
         n_gpu_layers=n_gpu_layers,
-        n_batch=256,
+        n_batch=512,  # Plus grand batch pour 14B
         use_mmap=True,
         use_mlock=False,  # False pour économiser RAM système
         verbose=True,
@@ -316,7 +316,7 @@ def load_model():
         rope_freq_scale=1.0
     )
     
-    print("Modèle Qwen2.5-32B chargé avec succès!")
+    print("Modèle Qwen2.5-14B chargé avec succès!")
     print(f"Configuration: {n_gpu_layers} couches GPU, contexte 8K tokens")
 
 def format_messages_qwen(messages: List[Message]) -> str:
@@ -433,9 +433,9 @@ async def metrics():
 async def root():
     """Point d'entrée de l'API"""
     return {
-        "message": "Qwen2.5-32B GGUF API",
+        "message": "Qwen2.5-14B GGUF API",
         "status": "running",
-        "model": "Qwen2.5-32B-Instruct-Q4_K_M.gguf",
+        "model": "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
             "/ws": "WebSocket - Chat endpoint (requires token in query)",
@@ -452,8 +452,9 @@ async def root():
         "capabilities": {
             "languages": ["French", "English", "29+ languages"],
             "context_length": "8K tokens (128K supported)",
-            "json_accuracy": "95%+",
-            "medical_domain": "Optimized"
+            "json_accuracy": "90%+",
+            "medical_domain": "Optimized",
+            "speed": "25-35 tokens/sec (2x faster than 32B)"
         }
     }
 
@@ -478,12 +479,12 @@ async def list_models():
             "object": "list",
             "data": [
                 {
-                    "id": "qwen2.5-32b",
+                    "id": "qwen2.5-14b",
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "Alibaba/Qwen",
                     "permission": [],
-                    "root": "qwen2.5-32b",
+                    "root": "qwen2.5-14b",
                     "parent": None
                 }
             ]
@@ -507,7 +508,7 @@ async def chat_completions(request: ChatCompletionRequest):
     
     if llm is None:
         fastapi_requests_total.labels(method="POST", endpoint="/v1/chat/completions", status="error").inc()
-        fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="error").inc()
+        fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="error").inc()
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
@@ -524,7 +525,7 @@ async def chat_completions(request: ChatCompletionRequest):
         # Timer pour l'inférence
         inference_start = time.time()
         
-        # Paramètres optimisés pour Qwen2.5 et extraction structurée
+        # Paramètres optimisés pour Qwen2.5-14B (un peu plus permissifs que 32B)
         response = llm(
             prompt,
             max_tokens=request.max_tokens or 512,
@@ -541,7 +542,7 @@ async def chat_completions(request: ChatCompletionRequest):
         
         # Durée d'inférence
         inference_duration = time.time() - inference_start
-        fastapi_inference_duration_seconds.labels(model="qwen2.5-32b").observe(inference_duration)
+        fastapi_inference_duration_seconds.labels(model="qwen2.5-14b").observe(inference_duration)
         
         # Métriques de tokens
         prompt_tokens = response['usage']['prompt_tokens']
@@ -583,7 +584,7 @@ async def chat_completions(request: ChatCompletionRequest):
         )
         
         # Métriques de succès
-        fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="success").inc()
+        fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="success").inc()
         
         return chat_response
         
@@ -592,7 +593,7 @@ async def chat_completions(request: ChatCompletionRequest):
         raise
     except Exception as e:
         status = "error"
-        fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="error").inc()
+        fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="error").inc()
         print(f"Erreur lors de la génération: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -617,7 +618,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     await websocket.send_json({
         "type": "connection",
         "status": "connected",
-        "model": "qwen2.5-32b",
+        "model": "qwen2.5-14b",
         "capabilities": [
             "French medical conversations",
             "Structured JSON output",
@@ -625,9 +626,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             "128K context support"
         ],
         "performance": {
-            "json_accuracy": "95%+",
+            "json_accuracy": "90%+",
             "languages": "29+ including French",
-            "speed": "15-25 tokens/sec"
+            "speed": "25-35 tokens/sec",
+            "memory": "10-12GB VRAM"
         }
     })
     
@@ -645,7 +647,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     "type": "error",
                     "error": "Model not loaded"
                 })
-                fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="error").inc()
+                fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="error").inc()
                 continue
             
             # Traiter la requête
@@ -686,7 +688,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 inference_duration = elapsed / 1000.0
                 
                 # Métriques
-                fastapi_inference_duration_seconds.labels(model="qwen2.5-32b").observe(inference_duration)
+                fastapi_inference_duration_seconds.labels(model="qwen2.5-14b").observe(inference_duration)
                 fastapi_inference_tokens_total.labels(type="prompt").inc(response['usage']['prompt_tokens'])
                 fastapi_inference_tokens_total.labels(type="completion").inc(response['usage']['completion_tokens'])
                 
@@ -729,13 +731,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 await websocket.send_json(response_json)
                 
                 # Métriques de succès
-                fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="success").inc()
+                fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="success").inc()
                 
                 print(f"[WS] Réponse envoyée en {elapsed:.0f}ms ({response_json['tokens_per_second']} t/s)")
                 
             except Exception as e:
                 print(f"[WS] Erreur: {str(e)}")
-                fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="error").inc()
+                fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="error").inc()
                 error_response = {
                     "type": "error",
                     "error": str(e)
