@@ -194,7 +194,7 @@ class ChatCompletionRequest(BaseModel):
     model: str = "qwen2.5-14b"
     messages: List[Message]
     temperature: Optional[float] = 0.1  # Légèrement augmenté pour Qwen
-    max_tokens: Optional[int] = 512
+    max_tokens: Optional[int] = 2048
     top_p: Optional[float] = 0.1
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
@@ -640,7 +640,7 @@ async def chat_completions(request: ChatCompletionRequest):
         # Paramètres optimisés pour Qwen2.5-14B (un peu plus permissifs que 32B)
         response = llm(
             prompt,
-            max_tokens=request.max_tokens or 512,
+            max_tokens=request.max_tokens or 2048,
             temperature=request.temperature or 0.1,
             top_p=request.top_p or 0.1,
             top_k=20,  # Un peu plus permissif que Phi
@@ -797,7 +797,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 
                 response = llm(
                     prompt,
-                    max_tokens=data.get("max_tokens", 512),
+                    max_tokens=data.get("max_tokens", 2048),
                     temperature=data.get("temperature", 0.1),
                     top_p=data.get("top_p", 0.1),
                     top_k=data.get("top_k", 20),
