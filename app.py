@@ -337,19 +337,18 @@ def load_model():
         n_gpu_layers = -1
         print("Impossible de détecter la VRAM, chargement complet sur GPU")
     
-    # Configuration optimisée pour Qwen2.5-14B
+    # Configuration CORRIGÉE pour Qwen2.5-14B
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=8192,  # Qwen2.5 supporte 128K mais 8K suffisant pour conversations médicales
-        n_threads=12,  # Un peu moins que pour 32B
+        n_ctx=8192,  # Qwen2.5 supporte 128K mais 8K suffisant
+        n_threads=12,
         n_gpu_layers=n_gpu_layers,
-        n_batch=512,  # Plus grand batch pour 14B
+        n_batch=512,
         use_mmap=True,
-        use_mlock=False,  # False pour économiser RAM système
+        use_mlock=False,
         verbose=True,
-        seed=42,  # Pour reproductibilité
-        rope_scaling_type="linear",  # Support du contexte long
-        rope_freq_scale=1.0
+        seed=42
+        # RETIRÉ: rope_scaling_type et rope_freq_scale qui causent l'erreur
     )
     
     print("Modèle Qwen2.5-14B chargé avec succès!")
