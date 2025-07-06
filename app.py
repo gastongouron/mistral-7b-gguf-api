@@ -2,6 +2,7 @@
 """
 API FastAPI pour servir le modèle Qwen2.5-14B GGUF avec llama-cpp-python
 Optimisé pour conversations médicales françaises avec extraction JSON
+Télécharge automatiquement le modèle au premier démarrage
 """
 import os
 import time
@@ -12,6 +13,8 @@ import logging
 import asyncio
 import psutil
 import socket
+import urllib.request
+import sys
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -110,9 +113,14 @@ fastapi_inference_tokens_per_second = Gauge(
 # Métriques du modèle
 model_loaded = Gauge('model_loaded', 'Whether the model is loaded (1) or not (0)')
 model_loading_duration_seconds = Gauge('model_loading_duration_seconds', 'Time taken to load the model')
+model_download_progress = Gauge('model_download_progress', 'Model download progress in percentage')
 
 # Queue pour simuler la file d'attente
 inference_queue = asyncio.Queue(maxsize=1000)
+
+# Variable globale pour l'état du téléchargement
+download_in_progress = False
+download_complete = False
 
 # ===== FONCTIONS UTILITAIRES POUR MÉTRIQUES =====
 
@@ -210,47 +218,6 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Choice]
     usage: Usage
 
-# ===== LIFESPAN POUR GÉRER LE CYCLE DE VIE =====
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Gestion du cycle de vie de l'application"""
-    # Démarrage
-    model_start = time.time()
-    load_model()
-    model_loading_duration_seconds.set(time.time() - model_start)
-    model_loaded.set(1)
-    
-    # Démarrer la tâche de mise à jour des métriques
-    metrics_task = asyncio.create_task(metrics_update_task())
-    
-    yield
-    
-    # Arrêt
-    model_loaded.set(0)
-    metrics_task.cancel()
-    try:
-        await metrics_task
-    except asyncio.CancelledError:
-        pass
-
-# Initialisation de l'application avec lifespan
-app = FastAPI(
-    title="Qwen2.5-14B GGUF API",
-    version="2.0.0",
-    description="API FastAPI pour Qwen2.5-14B optimisée pour conversations médicales françaises avec JSON structuré",
-    lifespan=lifespan
-)
-
-# Configuration CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Variable globale pour le modèle
 llm = None
 
@@ -265,15 +232,84 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     return credentials.credentials
 
 def download_model_if_needed():
-    """Vérifier que le modèle existe"""
-    if not os.path.exists(MODEL_PATH):
-        print(f"Modèle non trouvé à {MODEL_PATH}")
-        raise Exception("Le modèle doit être pré-téléchargé dans l'image Docker")
+    """Télécharger le modèle au premier démarrage si nécessaire"""
+    global download_in_progress, download_complete
+    
+    if os.path.exists(MODEL_PATH):
+        file_size = os.path.getsize(MODEL_PATH)
+        if file_size > 5_000_000_000:  # Plus de 5GB, probablement OK
+            print(f"Modèle trouvé: {file_size / (1024**3):.1f} GB")
+            download_complete = True
+            return
+        else:
+            print(f"Modèle incomplet ({file_size / (1024**3):.1f} GB), re-téléchargement...")
+            os.remove(MODEL_PATH)
+    
+    if download_in_progress:
+        print("Téléchargement déjà en cours...")
+        return
+    
+    download_in_progress = True
+    print(f"Téléchargement du modèle Qwen2.5-14B... (~8.1 GB)")
+    print(f"URL: {MODEL_URL}")
+    print("Cela peut prendre 10-20 minutes selon votre connexion...")
+    
+    # Créer le répertoire si nécessaire
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    
+    def download_progress(block_num, block_size, total_size):
+        """Callback pour afficher la progression"""
+        downloaded = block_num * block_size
+        percent = min(downloaded * 100 / total_size, 100)
+        mb_downloaded = downloaded / 1024 / 1024
+        mb_total = total_size / 1024 / 1024
+        
+        # Mettre à jour la métrique Prometheus
+        model_download_progress.set(percent)
+        
+        # Afficher la progression
+        sys.stdout.write(f'\rTéléchargement: {percent:.1f}% ({mb_downloaded:.1f}/{mb_total:.1f} MB) ')
+        sys.stdout.flush()
+        
+        # Log tous les 10%
+        if int(percent) % 10 == 0 and int(percent) != int((block_num - 1) * block_size * 100 / total_size):
+            logging.info(f"Téléchargement du modèle: {percent:.0f}%")
+    
+    try:
+        start_time = time.time()
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH, reporthook=download_progress)
+        print("\n✅ Téléchargement terminé!")
+        
+        download_time = time.time() - start_time
+        print(f"Temps de téléchargement: {download_time/60:.1f} minutes")
+        
+        # Vérifier la taille
+        file_size = os.path.getsize(MODEL_PATH)
+        print(f"Taille du fichier: {file_size / (1024**3):.1f} GB")
+        
+        if file_size < 5_000_000_000:
+            raise Exception(f"Fichier trop petit: {file_size} bytes")
+        
+        download_complete = True
+        model_download_progress.set(100)
+        
+    except Exception as e:
+        print(f"\n❌ Erreur lors du téléchargement: {e}")
+        download_in_progress = False
+        model_download_progress.set(0)
+        
+        # Supprimer le fichier partiel
+        if os.path.exists(MODEL_PATH):
+            os.remove(MODEL_PATH)
+        raise
+    finally:
+        download_in_progress = False
 
 def load_model():
     """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-14B"""
     global llm
     
+    # S'assurer que le modèle est téléchargé
     download_model_if_needed()
     
     print(f"Chargement du modèle Qwen2.5-14B depuis {MODEL_PATH}...")
@@ -415,6 +451,56 @@ def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> st
             }, ensure_ascii=False)
     return text
 
+# ===== LIFESPAN POUR GÉRER LE CYCLE DE VIE =====
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Gestion du cycle de vie de l'application"""
+    # Démarrage
+    print("=== Démarrage de l'application ===")
+    
+    # Démarrer la tâche de mise à jour des métriques
+    metrics_task = asyncio.create_task(metrics_update_task())
+    
+    # Charger le modèle (incluant le téléchargement si nécessaire)
+    try:
+        model_start = time.time()
+        load_model()
+        model_loading_duration_seconds.set(time.time() - model_start)
+        model_loaded.set(1)
+        print("=== Modèle chargé, API prête ===")
+    except Exception as e:
+        print(f"Erreur lors du chargement du modèle: {e}")
+        model_loaded.set(0)
+    
+    yield
+    
+    # Arrêt
+    print("=== Arrêt de l'application ===")
+    model_loaded.set(0)
+    metrics_task.cancel()
+    try:
+        await metrics_task
+    except asyncio.CancelledError:
+        pass
+
+# Initialisation de l'application avec lifespan
+app = FastAPI(
+    title="Qwen2.5-14B GGUF API",
+    version="2.0.0",
+    description="API FastAPI pour Qwen2.5-14B optimisée pour conversations médicales françaises avec JSON structuré",
+    lifespan=lifespan
+)
+
+# Configuration CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # ===== ENDPOINT MÉTRIQUES =====
 
 @app.get("/metrics")
@@ -434,40 +520,59 @@ async def root():
     """Point d'entrée de l'API"""
     return {
         "message": "Qwen2.5-14B GGUF API",
-        "status": "running",
+        "status": "running" if llm is not None else "loading",
         "model": "Qwen2.5-14B-Instruct-Q4_K_M.gguf",
+        "model_loaded": llm is not None,
+        "download_complete": download_complete,
+        "download_in_progress": download_in_progress,
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
             "/ws": "WebSocket - Chat endpoint (requires token in query)",
             "/v1/models": "GET - List available models",
             "/health": "GET - Health check",
-            "/metrics": "GET - Prometheus metrics"
+            "/metrics": "GET - Prometheus metrics",
+            "/download-status": "GET - Model download status"
         },
         "optimized_for": [
             "French medical conversations",
             "Structured JSON output", 
             "Multi-turn dialogue",
             "Information extraction"
-        ],
-        "capabilities": {
-            "languages": ["French", "English", "29+ languages"],
-            "context_length": "8K tokens (128K supported)",
-            "json_accuracy": "90%+",
-            "medical_domain": "Optimized",
-            "speed": "25-35 tokens/sec (2x faster than 32B)"
-        }
+        ]
     }
 
 @app.get("/health")
 async def health_check():
     """Vérifier l'état de l'API"""
-    return {
-        "status": "healthy",
+    health_status = {
+        "status": "healthy" if llm is not None else "loading",
         "model_loaded": llm is not None,
         "model_path": MODEL_PATH,
         "model_exists": os.path.exists(MODEL_PATH),
-        "model_size": f"{os.path.getsize(MODEL_PATH) / (1024**3):.1f} GB" if os.path.exists(MODEL_PATH) else "N/A"
+        "download_complete": download_complete,
+        "download_in_progress": download_in_progress
     }
+    
+    if os.path.exists(MODEL_PATH):
+        health_status["model_size"] = f"{os.path.getsize(MODEL_PATH) / (1024**3):.1f} GB"
+    
+    return health_status
+
+@app.get("/download-status")
+async def download_status():
+    """Statut du téléchargement du modèle"""
+    status = {
+        "download_complete": download_complete,
+        "download_in_progress": download_in_progress,
+        "model_exists": os.path.exists(MODEL_PATH),
+        "download_progress_percent": model_download_progress._value._value if hasattr(model_download_progress, '_value') else 0
+    }
+    
+    if os.path.exists(MODEL_PATH):
+        status["current_size_gb"] = os.path.getsize(MODEL_PATH) / (1024**3)
+        status["expected_size_gb"] = 8.1
+    
+    return status
 
 @app.get("/v1/models", dependencies=[Depends(verify_token)])
 async def list_models():
@@ -485,7 +590,8 @@ async def list_models():
                     "owned_by": "Alibaba/Qwen",
                     "permission": [],
                     "root": "qwen2.5-14b",
-                    "parent": None
+                    "parent": None,
+                    "ready": llm is not None
                 }
             ]
         }
@@ -507,9 +613,16 @@ async def chat_completions(request: ChatCompletionRequest):
     status = "success"
     
     if llm is None:
-        fastapi_requests_total.labels(method="POST", endpoint="/v1/chat/completions", status="error").inc()
-        fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="error").inc()
-        raise HTTPException(status_code=503, detail="Model not loaded")
+        if download_in_progress:
+            raise HTTPException(
+                status_code=503, 
+                detail="Model is being downloaded. Please check /download-status for progress."
+            )
+        else:
+            raise HTTPException(
+                status_code=503, 
+                detail="Model not loaded. It will be downloaded on first access."
+            )
     
     try:
         # Ajouter à la queue
@@ -615,10 +728,13 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     fastapi_websocket_connections.inc()
     
     # Envoyer un message de bienvenue
-    await websocket.send_json({
+    welcome_msg = {
         "type": "connection",
         "status": "connected",
         "model": "qwen2.5-14b",
+        "model_loaded": llm is not None,
+        "download_complete": download_complete,
+        "download_in_progress": download_in_progress,
         "capabilities": [
             "French medical conversations",
             "Structured JSON output",
@@ -631,7 +747,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             "speed": "25-35 tokens/sec",
             "memory": "10-12GB VRAM"
         }
-    })
+    }
+    
+    if not llm and download_in_progress:
+        welcome_msg["warning"] = "Model is being downloaded. Please wait..."
+    
+    await websocket.send_json(welcome_msg)
     
     try:
         while True:
@@ -643,10 +764,15 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             
             # Vérifier que le modèle est chargé
             if llm is None:
-                await websocket.send_json({
+                error_msg = {
                     "type": "error",
                     "error": "Model not loaded"
-                })
+                }
+                if download_in_progress:
+                    error_msg["error"] = "Model is being downloaded. Please check /download-status"
+                    error_msg["download_progress"] = model_download_progress._value._value if hasattr(model_download_progress, '_value') else 0
+                
+                await websocket.send_json(error_msg)
                 fastapi_inference_requests_total.labels(model="qwen2.5-14b", status="error").inc()
                 continue
             
