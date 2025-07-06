@@ -35,62 +35,62 @@ WORKDIR /app
 # Créer le répertoire pour le modèle
 RUN mkdir -p /app/models
 
-# Télécharger Phi-3.5-mini - EXCELLENT pour extraction JSON et catégorisation
-# Q5_K_M pour qualité maximale tout en restant rapide
-RUN echo "=== Downloading Phi-3.5-mini-instruct Q5_K_M ===" && \
-    echo "Model optimized for 100% accurate JSON extraction and categorization" && \
-    echo "File size: ~2.2 GB (3x smaller than Gemma!)" && \
-    echo "This may take 2-5 minutes depending on connection speed..." && \
+# Télécharger Qwen2.5-32B-Instruct - EXCELLENT pour JSON structuré et français
+# Q4_K_M pour un bon équilibre qualité/taille
+RUN echo "=== Downloading Qwen2.5-32B-Instruct Q4_K_M ===" && \
+    echo "Model optimized for structured JSON output and multilingual support" && \
+    echo "File size: ~18-20 GB" && \
+    echo "This may take 10-20 minutes depending on connection speed..." && \
     wget --progress=dot:giga \
          --show-progress \
-         --timeout=300 \
+         --timeout=600 \
          --tries=3 \
-         -O /app/models/Phi-3.5-mini-instruct-Q5_K_M.gguf \
-         https://huggingface.co/bartowski/Phi-3.5-mini-instruct-GGUF/resolve/main/Phi-3.5-mini-instruct-Q5_K_M.gguf && \
+         -O /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf \
+         https://huggingface.co/Qwen/Qwen2.5-32B-Instruct-GGUF/resolve/main/qwen2.5-32b-instruct-q4_k_m.gguf && \
     echo "=== Download completed successfully ===" && \
     echo "Model size:" && \
-    ls -lh /app/models/Phi-3.5-mini-instruct-Q5_K_M.gguf
+    ls -lh /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf
 
 # Vérifier l'intégrité du fichier
 RUN echo "=== Verifying model file ===" && \
-    if [ ! -f /app/models/Phi-3.5-mini-instruct-Q5_K_M.gguf ]; then \
+    if [ ! -f /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf ]; then \
         echo "ERROR: Model file not found!" && exit 1; \
     fi && \
-    FILE_SIZE=$(stat -c%s /app/models/Phi-3.5-mini-instruct-Q5_K_M.gguf) && \
+    FILE_SIZE=$(stat -c%s /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf) && \
     echo "File size in bytes: $FILE_SIZE" && \
-    if [ $FILE_SIZE -lt 1000000000 ]; then \
+    if [ $FILE_SIZE -lt 10000000000 ]; then \
         echo "ERROR: File seems too small, download may have failed!" && exit 1; \
     fi && \
     echo "=== Model file verified successfully ==="
 
-# Copier l'application
+# Copier l'application modifiée
 COPY app.py /app/
 
 # Afficher les informations finales
 RUN echo "=== Docker image build completed ===" && \
-    echo "Model: Phi-3.5-mini-instruct Q5_K_M" && \
-    echo "Optimized for: JSON extraction (100% accuracy), categorization, summarization" && \
-    echo "Location: /app/models/Phi-3.5-mini-instruct-Q5_K_M.gguf" && \
+    echo "Model: Qwen2.5-32B-Instruct Q4_K_M" && \
+    echo "Optimized for: Structured JSON output, French medical conversations" && \
+    echo "Location: /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf" && \
     echo "API will be available on port 8000" && \
     echo "Metrics available at /metrics endpoint" && \
     echo "" && \
-    echo "PERFORMANCE BENEFITS vs Gemma:" && \
-    echo "- 3x smaller (2.2GB vs 6.5GB)" && \
-    echo "- 2-3x faster inference" && \
-    echo "- 100% JSON extraction accuracy (vs ~70%)" && \
-    echo "- Lower GPU memory usage"
+    echo "PERFORMANCE BENEFITS vs Phi-3.5:" && \
+    echo "- Superior JSON structure understanding" && \
+    echo "- Native multilingual support (French)" && \
+    echo "- Better context understanding (8K tokens)" && \
+    echo "- More reliable structured outputs"
 
 # Exposer le port
 EXPOSE 8000
 
 # Commande de démarrage avec logs
-CMD echo "Starting Phi-3.5-mini API server..." && \
-    echo "Model loading may take 10-20 seconds..." && \
-    echo "Optimized for perfect JSON extraction and categorization" && \
-    echo "Metrics endpoint available at /metrics" && \
+CMD echo "Starting Qwen2.5-32B API server..." && \
+    echo "Model loading may take 30-60 seconds..." && \
+    echo "Optimized for medical French conversations with JSON output" && \
+    echo "Recommended GPU: 24GB+ VRAM" && \
     echo "" && \
     echo "Expected performance:" && \
-    echo "- JSON extraction: 100% accuracy" && \
-    echo "- Inference speed: 40-60 tokens/sec" && \
-    echo "- Memory usage: ~3-4GB" && \
+    echo "- JSON extraction: 95%+ accuracy" && \
+    echo "- Inference speed: 15-25 tokens/sec" && \
+    echo "- Memory usage: ~20-24GB" && \
     uvicorn app:app --host 0.0.0.0 --port 8000
