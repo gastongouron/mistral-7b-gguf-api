@@ -29,11 +29,11 @@ RUN echo "Installing FastAPI and dependencies..." && \
     pip install fastapi uvicorn[standard] pydantic httpx \
     prometheus-client psutil pynvml
 
-# Créer le répertoire de travail
+# Créer le répertoire de travail ET le répertoire des modèles
 WORKDIR /app
-
-# Créer le répertoire pour le modèle
-RUN mkdir -p /app/models
+RUN mkdir -p /app/models && \
+    echo "Created directory: /app/models" && \
+    ls -la /app/
 
 # Télécharger Qwen2.5-32B-Instruct - Version GGUF par bartowski
 # Q4_K_M pour un bon équilibre qualité/taille
@@ -41,11 +41,12 @@ RUN echo "=== Downloading Qwen2.5-32B-Instruct Q4_K_M ===" && \
     echo "Model optimized for structured JSON output and multilingual support" && \
     echo "File size: ~18.4 GB" && \
     echo "This may take 10-20 minutes depending on connection speed..." && \
+    cd /app/models && \
     wget --progress=dot:giga \
          --show-progress \
          --timeout=600 \
          --tries=3 \
-         -O /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf \
+         -O Qwen2.5-32B-Instruct-Q4_K_M.gguf \
          "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q4_K_M.gguf" && \
     echo "=== Download completed successfully ===" && \
     echo "Model size:" && \
@@ -72,7 +73,10 @@ RUN echo "=== Docker image build completed ===" && \
     echo "Optimized for: Structured JSON output, French medical conversations" && \
     echo "Location: /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf" && \
     echo "API will be available on port 8000" && \
-    echo "Metrics available at /metrics endpoint"
+    echo "Metrics available at /metrics endpoint" && \
+    echo "" && \
+    echo "Directory contents:" && \
+    ls -la /app/models/
 
 # Exposer le port
 EXPOSE 8000
@@ -82,4 +86,8 @@ CMD echo "Starting Qwen2.5-32B API server..." && \
     echo "Model loading may take 30-60 seconds..." && \
     echo "Optimized for medical French conversations with JSON output" && \
     echo "Recommended GPU: 24GB+ VRAM" && \
+    echo "" && \
+    echo "Checking model file..." && \
+    ls -lh /app/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf && \
+    echo "" && \
     uvicorn app:app --host 0.0.0.0 --port 8000
