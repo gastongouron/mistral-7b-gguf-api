@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 API FastAPI pour servir le modèle Mixtral-8x7B GGUF avec llama-cpp-python
-Version avec STREAMING NATIF pour conversations médicales françaises
-Production-ready avec gestion d'erreurs, métriques et resilience
+Optimisé pour conversations médicales françaises avec extraction JSON AMÉLIORÉE
+Version avec parsing JSON intelligent et nettoyage automatique
 """
 import os
 import time
@@ -22,10 +22,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator
+from typing import List, Optional, Dict, Any, Tuple
 from llama_cpp import Llama
-import traceback
-from datetime import datetime
 
 # Import des métriques Prometheus
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
@@ -40,28 +38,16 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger(__name__)
 
-# ===== CONFIGURATION STREAMING =====
-STREAMING_CONFIG = {
-    "CHUNK_SIZE": 5,  # Tokens par chunk avant envoi
-    "SENTENCE_DELIMITERS": ['. ', '? ', '! ', '.\n', '?\n', '!\n', '... ', ', '],
-    "MAX_BUFFER_SIZE": 100,  # Caractères max dans le buffer
-    "YIELD_INTERVAL": 0.001,  # Pause entre les yields pour éviter la saturation
-    "FIRST_TOKEN_PRIORITY": True,  # Envoyer le premier token immédiatement
-}
-
-# ===== MÉTRIQUES PROMETHEUS ÉTENDUES =====
+# ===== MÉTRIQUES PROMETHEUS =====
 system_info = Info('fastapi_system', 'System information')
 system_info.info({
     'model': 'mixtral-8x7b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '5.0.0',  # Version avec streaming
-    'streaming_enabled': 'true'
+    'version': '4.0.0'  # Version avec JSON amélioré
 })
 
-# Métriques existantes
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
 gpu_memory_used_bytes = Gauge('gpu_memory_used_bytes', 'GPU memory used in bytes')
 gpu_memory_total_bytes = Gauge('gpu_memory_total_bytes', 'GPU memory total in bytes')
@@ -74,25 +60,20 @@ disk_usage_percent = Gauge('disk_usage_percent', 'Disk usage percentage')
 fastapi_requests_total = Counter('fastapi_requests_total', 'Total number of requests', ['method', 'endpoint', 'status'])
 fastapi_request_duration_seconds = Histogram('fastapi_request_duration_seconds', 'Request duration in seconds', ['method', 'endpoint'])
 fastapi_websocket_connections = Gauge('fastapi_websocket_connections', 'Number of active WebSocket connections')
-fastapi_inference_requests_total = Counter('fastapi_inference_requests_total', 'Total number of inference requests', ['model', 'status', 'mode'])
-fastapi_inference_duration_seconds = Histogram('fastapi_inference_duration_seconds', 'Inference duration in seconds', ['model', 'mode'], buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0])
+fastapi_inference_requests_total = Counter('fastapi_inference_requests_total', 'Total number of inference requests', ['model', 'status'])
+fastapi_inference_duration_seconds = Histogram('fastapi_inference_duration_seconds', 'Inference duration in seconds', ['model'], buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0])
 fastapi_inference_queue_size = Gauge('fastapi_inference_queue_size', 'Current inference queue size')
 fastapi_inference_tokens_total = Counter('fastapi_inference_tokens_total', 'Total tokens processed', ['type'])
 fastapi_inference_tokens_per_second = Gauge('fastapi_inference_tokens_per_second', 'Tokens generated per second')
 model_loaded = Gauge('model_loaded', 'Whether the model is loaded (1) or not (0)')
 model_loading_duration_seconds = Gauge('model_loading_duration_seconds', 'Time taken to load the model')
+model_download_progress = Gauge('model_download_progress', 'Model download progress in percentage')
+json_parse_success_total = Counter('json_parse_success_total', 'Number of successful JSON parses')
+json_parse_failure_total = Counter('json_parse_failure_total', 'Number of failed JSON parses')
 
-# Nouvelles métriques pour le streaming
-streaming_requests_total = Counter('streaming_requests_total', 'Total streaming requests')
-streaming_first_token_latency = Histogram('streaming_first_token_latency_seconds', 'Time to first token in streaming mode', buckets=[0.05, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0])
-streaming_chunks_sent = Counter('streaming_chunks_sent_total', 'Total streaming chunks sent')
-streaming_errors = Counter('streaming_errors_total', 'Streaming errors', ['error_type'])
-websocket_active_streams = Gauge('websocket_active_streams', 'Currently active streaming sessions')
-
-# Gestion de la queue et du modèle
-inference_queue = asyncio.Queue(maxsize=100)
-active_streams = {}
-llm = None
+inference_queue = asyncio.Queue(maxsize=1000)
+download_in_progress = False
+download_complete = False
 
 # ===== FONCTIONS DE MÉTRIQUES =====
 def update_gpu_metrics():
@@ -113,7 +94,7 @@ def update_gpu_metrics():
         except:
             pass
     except Exception as e:
-        logger.debug(f"Impossible de collecter les métriques GPU: {e}")
+        logging.debug(f"Impossible de collecter les métriques GPU: {e}")
 
 def update_system_metrics():
     try:
@@ -124,195 +105,216 @@ def update_system_metrics():
         disk = psutil.disk_usage('/')
         disk_usage_percent.set(disk.percent)
     except Exception as e:
-        logger.debug(f"Impossible de collecter les métriques système: {e}")
+        logging.debug(f"Impossible de collecter les métriques système: {e}")
 
 async def metrics_update_task():
     while True:
         update_gpu_metrics()
         update_system_metrics()
         fastapi_inference_queue_size.set(inference_queue.qsize())
-        websocket_active_streams.set(len(active_streams))
         await asyncio.sleep(5)
 
-# ===== GESTION DU STREAMING =====
-class StreamingSession:
-    """Classe pour gérer une session de streaming"""
-    def __init__(self, session_id: str, websocket: WebSocket):
-        self.session_id = session_id
-        self.websocket = websocket
-        self.start_time = time.time()
-        self.first_token_time = None
-        self.token_count = 0
-        self.chunk_count = 0
-        self.buffer = ""
-        self.is_active = True
-        
-    async def send_chunk(self, text: str, chunk_type: str = "text_chunk"):
-        """Envoie un chunk avec gestion d'erreur"""
-        if not self.is_active:
-            return False
-            
-        try:
-            self.chunk_count += 1
-            await self.websocket.send_json({
-                "type": chunk_type,
-                "text": text,
-                "chunk_id": self.chunk_count,
-                "timestamp": int(time.time() * 1000)
-            })
-            streaming_chunks_sent.inc()
-            return True
-        except Exception as e:
-            logger.error(f"[STREAM {self.session_id}] Erreur envoi chunk: {e}")
-            streaming_errors.labels(error_type="send_error").inc()
-            self.is_active = False
-            return False
-    
-    def should_send_buffer(self) -> bool:
-        """Détermine si le buffer doit être envoyé"""
-        if not self.buffer:
-            return False
-            
-        # Vérifier les délimiteurs de phrase
-        for delimiter in STREAMING_CONFIG["SENTENCE_DELIMITERS"]:
-            if delimiter in self.buffer:
-                return True
-                
-        # Vérifier la taille du buffer
-        if len(self.buffer) >= STREAMING_CONFIG["MAX_BUFFER_SIZE"]:
-            return True
-            
-        return False
-    
-    async def close(self):
-        """Ferme proprement la session"""
-        self.is_active = False
-        if self.session_id in active_streams:
-            del active_streams[self.session_id]
+# ===== PARSING JSON AMÉLIORÉ =====
 
-# ===== STREAMING LLM =====
-async def stream_llm_response(
-    prompt: str,
-    session: StreamingSession,
-    temperature: float = 0.7,
-    max_tokens: int = 200,
-    stop_sequences: Optional[List[str]] = None
-) -> Dict[str, Any]:
+def clean_escaped_json(text: str) -> str:
+    """Nettoie les caractères d'échappement dans le JSON"""
+    # Remplace les underscores échappés
+    text = text.replace(r'\_', '_')
+    # Remplace les doubles backslashes
+    text = text.replace('\\\\', '\\')
+    # Nettoie les espaces et retours à la ligne excessifs
+    text = re.sub(r'\n\s*\n', '\n', text)
+    return text
+
+def extract_json_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
     """
-    Génère et stream la réponse du LLM
-    Retourne les statistiques de génération
+    Extrait le JSON d'un texte et retourne (json_str, remaining_text)
+    Version améliorée qui gère plusieurs formats
     """
-    if not llm:
-        raise ValueError("Model not loaded")
+    text = text.strip()
     
-    stats = {
-        "total_tokens": 0,
-        "time_to_first_token": None,
-        "total_time": 0,
-        "tokens_per_second": 0,
-        "full_text": ""
-    }
+    # Nettoie d'abord les échappements
+    text = clean_escaped_json(text)
+    
+    # Cas 1: Le texte commence et finit par des accolades
+    if text.startswith('{') and text.endswith('}'):
+        return text, None
+    
+    # Cas 2: JSON dans des balises code
+    json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1).strip()
+        remaining = text[:json_match.start()] + text[json_match.end():]
+        return json_str, remaining.strip() if remaining.strip() else None
+    
+    # Cas 3: JSON avec un préfixe (JSON:, json:, etc.)
+    json_prefix_match = re.search(r'(?:JSON|json|Json):\s*({.*?})', text, re.DOTALL)
+    if json_prefix_match:
+        json_str = json_prefix_match.group(1)
+        remaining = text[:json_prefix_match.start()] + text[json_prefix_match.end():]
+        return json_str, remaining.strip() if remaining.strip() else None
+    
+    # Cas 4: Cherche la première accolade ouvrante et la dernière fermante
+    start = text.find('{')
+    if start != -1:
+        # Compte les accolades pour trouver la fin correcte
+        count = 0
+        end = -1
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                count += 1
+            elif text[i] == '}':
+                count -= 1
+                if count == 0:
+                    end = i
+                    break
+        
+        if end != -1:
+            json_str = text[start:end+1]
+            remaining = text[:start] + text[end+1:]
+            return json_str, remaining.strip() if remaining.strip() else None
+    
+    # Cas 5: Pas de JSON trouvé
+    return None, text
+
+def smart_json_parse(text: str) -> Dict[str, Any]:
+    """
+    Parse intelligent du JSON avec plusieurs stratégies de récupération
+    """
+    original_text = text
+    
+    # Étape 1: Extraction du JSON
+    json_str, remaining_text = extract_json_from_text(text)
+    
+    if not json_str:
+        logging.warning("Aucun JSON trouvé dans la réponse")
+        json_parse_failure_total.inc()
+        return {
+            "error": "No JSON found in response",
+            "original_response": original_text
+        }
+    
+    # Étape 2: Tentative de parsing direct
+    try:
+        result = json.loads(json_str)
+        json_parse_success_total.inc()
+        
+        # Si il y a du texte supplémentaire, on peut l'ajouter comme metadata
+        if remaining_text:
+            result["_metadata"] = {
+                "additional_text": remaining_text,
+                "json_extracted": True
+            }
+        
+        return result
+    except json.JSONDecodeError as e:
+        logging.warning(f"Première tentative de parsing échouée: {e}")
+    
+    # Étape 3: Nettoyage et nouvelle tentative
+    # Retire les commentaires style //
+    json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
+    # Retire les virgules trailing
+    json_str = re.sub(r',\s*}', '}', json_str)
+    json_str = re.sub(r',\s*]', ']', json_str)
     
     try:
-        # Créer le stream
-        stream = llm(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            top_p=0.9,
-            top_k=40,
-            stop=stop_sequences or ["</s>", "[INST]", "[/INST]"],
-            echo=False,
-            repeat_penalty=1.1,
-            stream=True
-        )
+        result = json.loads(json_str)
+        json_parse_success_total.inc()
         
-        # Envoyer le signal de début
-        await session.send_chunk("", "stream_start")
+        if remaining_text:
+            result["_metadata"] = {
+                "additional_text": remaining_text,
+                "json_extracted": True,
+                "required_cleanup": True
+            }
         
-        # Traiter le stream
-        for i, output in enumerate(stream):
-            if not session.is_active:
-                break
-                
-            # Extraire le token
-            token = output['choices'][0]['text']
-            if not token:
-                continue
-                
-            session.token_count += 1
-            stats["total_tokens"] += 1
-            stats["full_text"] += token
-            
-            # Enregistrer le temps du premier token
-            if session.first_token_time is None:
-                session.first_token_time = time.time()
-                stats["time_to_first_token"] = session.first_token_time - session.start_time
-                streaming_first_token_latency.observe(stats["time_to_first_token"])
-                logger.info(f"[STREAM {session.session_id}] Premier token en {stats['time_to_first_token']*1000:.0f}ms")
-            
-            # Ajouter au buffer
-            session.buffer += token
-            
-            # Envoyer immédiatement le premier token si configuré
-            if (i == 0 and STREAMING_CONFIG["FIRST_TOKEN_PRIORITY"]) or session.should_send_buffer():
-                if await session.send_chunk(session.buffer):
-                    session.buffer = ""
-                else:
-                    break
-            
-            # Yield périodique pour éviter de bloquer
-            if session.token_count % 10 == 0:
-                await asyncio.sleep(STREAMING_CONFIG["YIELD_INTERVAL"])
+        return result
+    except json.JSONDecodeError as e:
+        logging.warning(f"Deuxième tentative échouée: {e}")
+    
+    # Étape 4: Tentative de réparation avec regex
+    # Essaie de corriger les clés sans guillemets
+    json_str = re.sub(r'(\w+):', r'"\1":', json_str)
+    # Corrige les valeurs true/false/null
+    json_str = re.sub(r'\btrue\b', 'true', json_str, flags=re.IGNORECASE)
+    json_str = re.sub(r'\bfalse\b', 'false', json_str, flags=re.IGNORECASE)
+    json_str = re.sub(r'\bnull\b', 'null', json_str, flags=re.IGNORECASE)
+    
+    try:
+        result = json.loads(json_str)
+        json_parse_success_total.inc()
         
-        # Envoyer le buffer restant
-        if session.buffer and session.is_active:
-            await session.send_chunk(session.buffer)
+        if remaining_text:
+            result["_metadata"] = {
+                "additional_text": remaining_text,
+                "json_extracted": True,
+                "heavy_cleanup": True
+            }
         
-        # Calculer les stats finales
-        stats["total_time"] = time.time() - session.start_time
-        stats["tokens_per_second"] = stats["total_tokens"] / stats["total_time"] if stats["total_time"] > 0 else 0
+        return result
+    except json.JSONDecodeError as e:
+        logging.error(f"Toutes les tentatives de parsing ont échoué: {e}")
+        json_parse_failure_total.inc()
         
-        # Envoyer le signal de fin avec les stats
-        if session.is_active:
-            await session.websocket.send_json({
-                "type": "stream_end",
-                "stats": {
-                    "total_tokens": stats["total_tokens"],
-                    "total_time_ms": round(stats["total_time"] * 1000),
-                    "time_to_first_token_ms": round(stats["time_to_first_token"] * 1000) if stats["time_to_first_token"] else None,
-                    "tokens_per_second": round(stats["tokens_per_second"], 2),
-                    "chunks_sent": session.chunk_count
-                }
-            })
+        # Retourne une structure d'erreur
+        return {
+            "error": "JSON parsing failed after all attempts",
+            "original_response": original_text,
+            "attempted_json": json_str,
+            "parse_error": str(e)
+        }
+
+def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> str:
+    """
+    S'assure que la réponse est un JSON valide
+    """
+    if request_format and request_format.get("type") == "json_object":
+        parsed = smart_json_parse(text)
         
-        return stats
+        # Nettoie les metadata si elles existent
+        if "_metadata" in parsed and not os.getenv("DEBUG_MODE"):
+            del parsed["_metadata"]
         
-    except Exception as e:
-        logger.error(f"[STREAM {session.session_id}] Erreur génération: {str(e)}")
-        streaming_errors.labels(error_type="generation_error").inc()
-        
-        if session.is_active:
-            await session.websocket.send_json({
-                "type": "error",
-                "error": str(e),
-                "timestamp": int(time.time() * 1000)
-            })
-        
-        raise
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    
+    return text
 
 # ===== MODÈLES PYDANTIC =====
 class Message(BaseModel):
     role: str
     content: str
 
-class StreamingRequest(BaseModel):
+class ChatCompletionRequest(BaseModel):
+    model: str = "mixtral-8x7b"
     messages: List[Message]
-    temperature: Optional[float] = 0.7
-    max_tokens: Optional[int] = 200
-    stream: Optional[bool] = True
-    request_id: Optional[str] = None
-    mode: Optional[str] = "conversational"  # conversational, json, extraction
+    temperature: Optional[float] = 0.1
+    max_tokens: Optional[int] = 4096
+    top_p: Optional[float] = 0.9
+    stream: Optional[bool] = False
+    stop: Optional[List[str]] = None
+    response_format: Optional[Dict[str, str]] = None
+    json_schema: Optional[Dict[str, Any]] = None  # Pour forcer un schéma spécifique
+
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class Choice(BaseModel):
+    index: int
+    message: Message
+    finish_reason: str
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[Choice]
+    usage: Usage
+
+# Variable globale pour le modèle
+llm = None
 
 # ===== AUTHENTIFICATION =====
 security = HTTPBearer()
@@ -328,14 +330,206 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     return credentials.credentials
 
 # ===== GESTION DU MODÈLE =====
+def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 5):
+    """Télécharge avec retry et gestion des erreurs 429"""
+    import urllib.error
+    
+    # Récupérer le token depuis les variables d'environnement
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    
+    if not hf_token:
+        print("⚠️  ATTENTION: Pas de token HuggingFace trouvé!")
+        print("   Définissez la variable HF_TOKEN pour éviter les erreurs 429")
+        print("   export HF_TOKEN='votre_token_ici'")
+    
+    # Essayer huggingface-cli en premier si token disponible
+    if hf_token and subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0:
+        print("🔑 Token HuggingFace détecté, utilisation de huggingface-cli...")
+        try:
+            # D'abord, configurer le token
+            subprocess.run(["huggingface-cli", "login", "--token", hf_token], 
+                         capture_output=True, check=True)
+            
+            # Puis télécharger
+            hf_cmd = [
+                "huggingface-cli", "download",
+                "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF",
+                "mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf",
+                "--local-dir", os.path.dirname(dest),
+                "--local-dir-use-symlinks", "False"
+            ]
+            
+            print("📥 Téléchargement avec huggingface-cli...")
+            result = subprocess.run(hf_cmd, text=True)
+            if result.returncode == 0:
+                print("✅ Téléchargement réussi avec huggingface-cli!")
+                return True
+            else:
+                print(f"⚠️ Échec huggingface-cli, tentative avec méthodes alternatives...")
+        except Exception as e:
+            print(f"⚠️ Erreur avec huggingface-cli: {e}")
+    
+    # Fallback sur les méthodes classiques
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                wait_time = delay * (2 ** attempt)
+                print(f"\n⏳ Attente de {wait_time}s avant nouvelle tentative...")
+                time.sleep(wait_time)
+            
+            print(f"\n📥 Tentative {attempt + 1}/{max_retries}")
+            
+            # Headers avec token si disponible
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            if hf_token:
+                headers['Authorization'] = f'Bearer {hf_token}'
+                print("🔑 Utilisation du token HF dans les headers")
+            
+            request = urllib.request.Request(url, headers=headers)
+            
+            def download_progress(block_num, block_size, total_size):
+                downloaded = block_num * block_size
+                percent = min(downloaded * 100 / total_size, 100)
+                mb_downloaded = downloaded / 1024 / 1024
+                mb_total = total_size / 1024 / 1024
+                model_download_progress.set(percent)
+                sys.stdout.write(f'\rTéléchargement: {percent:.1f}% ({mb_downloaded:.1f}/{mb_total:.1f} MB) ')
+                sys.stdout.flush()
+            
+            urllib.request.urlretrieve(request.full_url, dest, reporthook=download_progress)
+            print("\n✅ Téléchargement réussi!")
+            return True
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print(f"\n⚠️ Erreur 429: Limite de taux dépassée")
+                if not hf_token:
+                    print("💡 Conseil: Définissez HF_TOKEN pour éviter cette erreur")
+                if attempt < max_retries - 1:
+                    continue
+            else:
+                print(f"\n❌ Erreur HTTP {e.code}: {e.reason}")
+                if attempt < max_retries - 1:
+                    continue
+                raise
+    
+    # Dernière tentative avec wget
+    print("\n🔧 Tentative finale avec wget...")
+    try:
+        wget_cmd = ["wget", "-c", "-O", dest, url]
+        if hf_token:
+            wget_cmd.extend(["--header", f"Authorization: Bearer {hf_token}"])
+        subprocess.run(wget_cmd, check=True)
+        return True
+    except:
+        print("\n❌ Toutes les tentatives ont échoué")
+        if not hf_token:
+            print("\n💡 Solution: Définissez la variable d'environnement HF_TOKEN")
+            print("   export HF_TOKEN='votre_token_huggingface'")
+        return False
+
+def download_model_if_needed():
+    """Télécharger le modèle au premier démarrage si nécessaire"""
+    global download_in_progress, download_complete
+    
+    if os.path.exists(MODEL_PATH):
+        file_size = os.path.getsize(MODEL_PATH)
+        if file_size > 30_000_000_000:
+            print(f"✅ Modèle trouvé: {file_size / (1024**3):.1f} GB")
+            download_complete = True
+            return
+        else:
+            print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")
+            # Ne pas supprimer, wget peut reprendre
+    
+    if download_in_progress:
+        print("⏳ Téléchargement déjà en cours...")
+        return
+    
+    download_in_progress = True
+    
+    # URLs alternatives avec différentes méthodes
+    urls = [
+        MODEL_URL,
+        # Tentative avec paramètre download
+        "https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf?download=true",
+        # Via CDN alternatif (si disponible)
+        "https://cdn-lfs.huggingface.co/repos/47/23/4723e5fff847c49ee1a4b5056cf1aec01e866c8f7e09c0d8bb8e9b4ad27e2659/4aa8069d24261fd1da11dd0e5f5b0b7f5fe7bd20397cd72e8d4686cbcb6ee72d?response-content-disposition=attachment%3B+filename*%3DUTF-8%27%27mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf%3B+filename%3D%22mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf%22%3B&response-content-type=application%2Foctet-stream&Expires=1720612362&Policy=eyJTdGF0ZW1lbnQiOlt7IkNvbmRpdGlvbiI6eyJEYXRlTGVzc1RoYW4iOnsiQVdTOkVwb2NoVGltZSI6MTcyMDYxMjM2Mn19LCJSZXNvdXJjZSI6Imh0dHBzOi8vY2RuLWxmcy5odWdnaW5nZmFjZS5jby9yZXBvcy80Ny8yMy80NzIzZTVmZmY4NDdjNDllZTFhNGI1MDU2Y2YxYWVjMDFlODY2YzhmN2UwOWMwZDhiYjhlOWI0YWQyN2UyNjU5LzRhYTgwNjlkMjQyNjFmZDFkYTExZGQwZTVmNWIwYjdmNWZlN2JkMjAzOTdjZDcyZThkNDY4NmNiY2I2ZWU3MmQ%7EcmVzcG9uc2UtY29udGVudC1kaXNwb3NpdGlvbj0qJnJlc3BvbnNlLWNvbnRlbnQtdHlwZT0qIn1dfQ__&Signature=aBqZVyARPNPTWRD8ZH9sM0oAl6fTXFNWYVTcf87jmvqXgwBQCqGOgPQ3oVwZa0OKuLgqKVQZGCV7KCJH8pdcCa2hBhwkMJdqGBOiNqtFc-y6aOEk6bhZUE-KvYjMBnQZJo8T8HBNsAqSacBnxNFg3SLPJoqOx6Fwf6R8JgAepbRMhGRWEQs9l7ItnKlBKSxvASMRaM8LhVgeLCMvTTdCN93ruBu4eMBV2TvaZVocDAXFH2iKvYpG7kkUenIs8KiVxAMtBb0pFfaM8hNxGpu4xVz40fQY1lDijkiESYqcCq9sNQgvJYACtj9k-lQgH0VxaL0rT4dve9MhnqKf3AiWMA__&Key-Pair-Id=KVTP0A1DKRTAX",
+    ]
+    
+    # Essayer aussi avec huggingface-cli si disponible
+    hf_cli_available = subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0
+    
+    print(f"\n{'='*60}")
+    print(f"📥 TÉLÉCHARGEMENT DU MODÈLE MIXTRAL-8X7B")
+    print(f"{'='*60}")
+    print(f"📦 Taille: ~32.9 GB")
+    print(f"📍 Destination: {MODEL_PATH}")
+    print(f"⏱️ Temps estimé: 20-40 minutes")
+    print(f"{'='*60}\n")
+    
+    os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
+    
+    try:
+        start_time = time.time()
+        
+        # Essayer chaque URL
+        success = False
+        for url in urls:
+            print(f"\n🔗 Essai avec : {url}")
+            if download_with_retry(url, MODEL_PATH):
+                success = True
+                break
+        
+        if not success:
+            raise Exception("Échec du téléchargement après toutes les tentatives")
+        
+        print("\n✅ Téléchargement terminé!")
+        
+        download_time = time.time() - start_time
+        print(f"⏱️ Temps de téléchargement: {download_time/60:.1f} minutes")
+        
+        file_size = os.path.getsize(MODEL_PATH)
+        print(f"📦 Taille du fichier: {file_size / (1024**3):.1f} GB")
+        
+        if file_size < 30_000_000_000:
+            raise Exception(f"Fichier trop petit: {file_size} bytes")
+        
+        download_complete = True
+        model_download_progress.set(100)
+        
+    except Exception as e:
+        print(f"\n❌ Erreur lors du téléchargement: {e}")
+        download_in_progress = False
+        model_download_progress.set(0)
+        
+        # Instructions pour téléchargement manuel
+        print("\n" + "="*60)
+        print("📋 TÉLÉCHARGEMENT MANUEL REQUIS")
+        print("="*60)
+        print("\nPour contourner la limite de HuggingFace :")
+        print(f"\n1. Téléchargez le modèle avec votre navigateur :")
+        print(f"   {MODEL_URL}")
+        print(f"\n2. Ou utilisez wget avec reprise :")
+        print(f"   wget -c '{MODEL_URL}' -O {MODEL_PATH}")
+        print(f"\n3. Ou utilisez huggingface-cli :")
+        print(f"   pip install huggingface-hub")
+        print(f"   huggingface-cli download TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf --local-dir /workspace/models/")
+        print("\n" + "="*60)
+        
+        raise
+    finally:
+        download_in_progress = False
+
 def load_model():
     """Charger le modèle GGUF avec configuration optimale pour Mixtral-8x7B"""
     global llm
     
-    logger.info(f"Chargement du modèle Mixtral-8x7B depuis {MODEL_PATH}...")
+    download_model_if_needed()
     
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(f"Modèle non trouvé: {MODEL_PATH}")
+    print(f"Chargement du modèle Mixtral-8x7B depuis {MODEL_PATH}...")
     
     try:
         import pynvml
@@ -343,20 +537,20 @@ def load_model():
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         vram_gb = mem_info.total / (1024**3)
-        logger.info(f"VRAM disponible: {vram_gb:.1f} GB")
+        print(f"VRAM disponible: {vram_gb:.1f} GB")
         
         if vram_gb >= 40:
             n_gpu_layers = -1
-            logger.info("Configuration: Modèle entièrement sur GPU (optimal pour streaming)")
+            print("Configuration: Modèle entièrement sur GPU (recommandé)")
         elif vram_gb >= 24:
             n_gpu_layers = 28
-            logger.info("Configuration: 28 couches sur GPU")
+            print("Configuration: 28 couches sur GPU")
         else:
             n_gpu_layers = 16
-            logger.warning(f"⚠️ VRAM limitée ({vram_gb:.1f}GB), performance streaming réduite")
+            print(f"⚠️ VRAM limitée ({vram_gb:.1f}GB), performance réduite (16 couches sur GPU)")
     except Exception as e:
         n_gpu_layers = -1
-        logger.info(f"Impossible de détecter la VRAM ({e}), chargement complet sur GPU")
+        print(f"Impossible de détecter la VRAM ({e}), tentative de chargement complet sur GPU")
     
     llm = Llama(
         model_path=MODEL_PATH,
@@ -367,67 +561,36 @@ def load_model():
         use_mmap=True,
         use_mlock=False,
         verbose=True,
-        seed=42,
-        # Optimisations pour le streaming
-        cache=True,
-        cache_type="ram",
-        low_vram=False
+        seed=42
     )
     
-    logger.info("✅ Modèle Mixtral-8x7B chargé avec succès!")
-    logger.info(f"Configuration streaming: {n_gpu_layers} couches GPU, contexte 32K tokens")
-
-def format_messages_for_streaming(messages: List[Message], mode: str = "conversational") -> str:
-    """
-    Formater les messages pour Mistral avec différents modes
-    """
-    if mode == "conversational":
-        # Mode conversationnel naturel pour le streaming
-        system_prompt = """Tu es un assistant médical français empathique et professionnel.
-Réponds de manière naturelle et conversationnelle, en phrases courtes et claires.
-Sois concis mais chaleureux. Maximum 2-3 phrases par réponse."""
-    else:
-        # Mode normal (json, extraction, etc.)
-        return format_messages_mistral(messages)
-    
-    # Remplacer ou ajouter le system prompt
-    prompt_parts = ["<s>"]
-    
-    if messages and messages[0].role == "system":
-        # Remplacer par notre prompt conversationnel
-        messages = messages.copy()
-        messages[0] = Message(role="system", content=system_prompt)
-    else:
-        # Ajouter notre prompt
-        messages = [Message(role="system", content=system_prompt)] + messages
-    
-    # Formatter selon le template Mistral
-    has_system = False
-    for i, message in enumerate(messages):
-        if message.role == "system":
-            prompt_parts.append(f"{message.content}\n\n")
-            has_system = True
-        elif message.role == "user":
-            if i == 1 and has_system:  # Premier user après system
-                prompt_parts.append(f"[INST] {message.content} [/INST]")
-            else:
-                prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
-        elif message.role == "assistant":
-            prompt_parts.append(f" {message.content}</s>")
-    
-    if not prompt_parts[-1].strip().endswith("</s>"):
-        prompt_parts.append(" ")
-    
-    return "".join(prompt_parts)
+    print("Modèle Mixtral-8x7B chargé avec succès!")
+    print(f"Configuration: {n_gpu_layers} couches GPU, contexte 32K tokens")
 
 def format_messages_mistral(messages: List[Message]) -> str:
-    """Format original pour compatibilité"""
+    """Formater les messages pour Mistral avec support JSON amélioré"""
     prompt_parts = ["<s>"]
     has_system_prompt = False
     
+    # Ajoute automatiquement une instruction pour le JSON si nécessaire
+    json_instruction = """You are a helpful assistant that ALWAYS responds with valid JSON.
+Your response must be ONLY the JSON object, with no additional text before or after.
+Do not include any explanations, comments, or markdown formatting.
+Just return the raw JSON object."""
+    
+    # Gérer le system prompt
     if messages and messages[0].role == "system":
-        prompt_parts.append(f"{messages[0].content}\n\n")
+        # Combine le system prompt existant avec l'instruction JSON
+        system_content = messages[0].content
+        if "json" in system_content.lower() or "JSON" in system_content:
+            prompt_parts.append(f"{system_content}\n\n")
+        else:
+            prompt_parts.append(f"{system_content}\n\n{json_instruction}\n\n")
         messages = messages[1:]
+        has_system_prompt = True
+    else:
+        # Ajoute l'instruction JSON comme system prompt
+        prompt_parts.append(f"{json_instruction}\n\n")
         has_system_prompt = True
 
     for i, message in enumerate(messages):
@@ -448,28 +611,21 @@ def format_messages_mistral(messages: List[Message]) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestion du cycle de vie de l'application"""
-    logger.info("=== Démarrage de l'application FastAPI Streaming ===")
+    print("=== Démarrage de l'application ===")
     metrics_task = asyncio.create_task(metrics_update_task())
-    
     try:
         model_start = time.time()
         load_model()
         model_loading_duration_seconds.set(time.time() - model_start)
         model_loaded.set(1)
-        logger.info("=== Modèle chargé, API prête pour le streaming ===")
+        print("=== Modèle chargé, API prête ===")
     except Exception as e:
-        logger.error(f"Erreur fatale lors du chargement du modèle: {e}")
+        print(f"Erreur fatale lors du chargement du modèle: {e}")
         model_loaded.set(0)
     
     yield
     
-    logger.info("=== Arrêt de l'application ===")
-    
-    # Fermer toutes les sessions de streaming actives
-    for session_id, session in list(active_streams.items()):
-        logger.info(f"Fermeture session streaming {session_id}")
-        await session.close()
-    
+    print("=== Arrêt de l'application ===")
     model_loaded.set(0)
     metrics_task.cancel()
     try:
@@ -479,9 +635,9 @@ async def lifespan(app: FastAPI):
 
 # ===== APPLICATION FASTAPI =====
 app = FastAPI(
-    title="Mixtral-8x7B Streaming API",
-    version="5.0.0",
-    description="API FastAPI pour Mixtral-8x7B avec streaming natif pour conversations temps réel",
+    title="Mixtral-8x7B GGUF API",
+    version="4.0.0",
+    description="API FastAPI pour Mixtral-8x7B avec parsing JSON intelligent",
     lifespan=lifespan
 )
 
@@ -495,29 +651,34 @@ app.add_middleware(
 
 # ===== ENDPOINTS =====
 
+@app.get("/metrics")
+async def metrics():
+    update_gpu_metrics()
+    update_system_metrics()
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 @app.get("/")
 async def root():
     return {
-        "message": "Mixtral-8x7B Streaming API",
+        "message": "Mixtral-8x7B GGUF API with Smart JSON Parsing",
         "status": "running" if llm is not None else "loading",
         "model": "Mixtral-8x7B-Instruct-v0.1.Q5_K_M.gguf",
         "model_loaded": llm is not None,
+        "download_complete": download_complete,
+        "download_in_progress": download_in_progress,
         "features": [
-            "Token streaming for real-time responses",
-            "Intelligent chunk batching",
-            "Low latency first token",
-            "Production-ready error handling",
-            "Prometheus metrics",
-            "Multiple conversation modes"
+            "Intelligent JSON parsing",
+            "Automatic escape character cleanup",
+            "Multiple JSON extraction strategies",
+            "Structured error responses"
         ],
-        "streaming_config": STREAMING_CONFIG,
-        "active_streams": len(active_streams),
         "endpoints": {
-            "/ws/stream": "WebSocket - Streaming conversation endpoint (recommended)",
-            "/ws": "WebSocket - Legacy endpoint with streaming support",
-            "/v1/chat/completions": "POST - OpenAI compatible endpoint",
-            "/health": "GET - Health check with detailed status",
-            "/metrics": "GET - Prometheus metrics"
+            "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
+            "/ws": "WebSocket - Chat endpoint (requires token in query)",
+            "/v1/models": "GET - List available models",
+            "/health": "GET - Health check",
+            "/metrics": "GET - Prometheus metrics",
+            "/download-status": "GET - Model download status"
         }
     }
 
@@ -528,413 +689,262 @@ async def health_check():
         "model_loaded": llm is not None,
         "model_path": MODEL_PATH,
         "model_exists": os.path.exists(MODEL_PATH),
-        "active_streams": len(active_streams),
-        "streaming_stats": {
-            "total_requests": streaming_requests_total._value._value if hasattr(streaming_requests_total, '_value') else 0,
-            "chunks_sent": streaming_chunks_sent._value._value if hasattr(streaming_chunks_sent, '_value') else 0,
-            "errors": streaming_errors._child_samples() if hasattr(streaming_errors, '_child_samples') else {}
-        },
-        "system_metrics": {
-            "cpu_percent": psutil.cpu_percent(),
-            "memory_percent": psutil.virtual_memory().percent,
-            "inference_queue_size": inference_queue.qsize()
+        "download_complete": download_complete,
+        "download_in_progress": download_in_progress,
+        "json_parse_stats": {
+            "success": json_parse_success_total._value._value if hasattr(json_parse_success_total, '_value') else 0,
+            "failure": json_parse_failure_total._value._value if hasattr(json_parse_failure_total, '_value') else 0
         }
     }
-    
     if os.path.exists(MODEL_PATH):
         health_status["model_size"] = f"{os.path.getsize(MODEL_PATH) / (1024**3):.1f} GB"
-    
     return health_status
 
-@app.get("/metrics")
-async def metrics():
-    update_gpu_metrics()
-    update_system_metrics()
-    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+@app.get("/download-status")
+async def download_status():
+    status = {
+        "download_complete": download_complete,
+        "download_in_progress": download_in_progress,
+        "model_exists": os.path.exists(MODEL_PATH),
+        "download_progress_percent": model_download_progress._value._value if hasattr(model_download_progress, '_value') else 0
+    }
+    if os.path.exists(MODEL_PATH):
+        status["current_size_gb"] = os.path.getsize(MODEL_PATH) / (1024**3)
+        status["expected_size_gb"] = 32.9
+    return status
 
-# ===== WEBSOCKET STREAMING PRINCIPAL =====
-@app.websocket("/ws/stream")
-async def websocket_streaming_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """
-    Endpoint WebSocket optimisé pour le streaming conversationnel
-    Conçu spécifiquement pour l'intégration avec Voximplant
-    """
-    if token != API_TOKEN:
-        await websocket.close(code=1008, reason="Invalid token")
-        return
+@app.get("/v1/models", dependencies=[Depends(verify_token)])
+async def list_models():
+    start_time = time.time()
+    try:
+        result = {
+            "object": "list",
+            "data": [
+                {
+                    "id": "mixtral-8x7b",
+                    "object": "model",
+                    "created": int(time.time()),
+                    "owned_by": "Mistral AI",
+                    "permission": [],
+                    "root": "mixtral-8x7b",
+                    "parent": None,
+                    "ready": llm is not None
+                }
+            ]
+        }
+        fastapi_requests_total.labels(method="GET", endpoint="/v1/models", status="success").inc()
+        return result
+    except Exception as e:
+        fastapi_requests_total.labels(method="GET", endpoint="/v1/models", status="error").inc()
+        raise
+    finally:
+        fastapi_request_duration_seconds.labels(method="GET", endpoint="/v1/models").observe(time.time() - start_time)
+
+@app.post("/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_token)])
+async def chat_completions(request: ChatCompletionRequest):
+    """Endpoint compatible OpenAI avec parsing JSON intelligent"""
+    start_time = time.time()
+    status = "success"
     
-    await websocket.accept()
-    fastapi_websocket_connections.inc()
-    streaming_requests_total.inc()
-    
-    session_id = f"stream_{uuid.uuid4().hex[:8]}"
-    session = StreamingSession(session_id, websocket)
-    active_streams[session_id] = session
-    
-    logger.info(f"[STREAM {session_id}] Nouvelle connexion WebSocket streaming")
-    
-    # Message de bienvenue
-    await websocket.send_json({
-        "type": "connection",
-        "status": "connected",
-        "session_id": session_id,
-        "model": "mixtral-8x7b",
-        "streaming": True,
-        "timestamp": int(time.time() * 1000)
-    })
+    if llm is None:
+        if download_in_progress:
+            raise HTTPException(status_code=503, detail="Model is being downloaded. Please check /download-status for progress.")
+        else:
+            raise HTTPException(status_code=503, detail="Model not loaded. It will be downloaded on first access.")
     
     try:
-        while True:
-            # Recevoir la requête
-            try:
-                data = await websocket.receive_json()
-            except json.JSONDecodeError:
-                await websocket.send_json({
-                    "type": "error",
-                    "error": "Invalid JSON",
-                    "timestamp": int(time.time() * 1000)
-                })
-                continue
+        await inference_queue.put(request)
+        
+        # Formatte le prompt avec support JSON amélioré
+        prompt = format_messages_mistral(request.messages)
+        
+        # Si un schéma JSON est fourni, l'ajoute au prompt
+        if request.json_schema:
+            schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(request.json_schema, indent=2)}"
+            prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
+        
+        inference_start = time.time()
+        
+        response = llm(
+            prompt,
+            max_tokens=request.max_tokens or 4096,
+            temperature=request.temperature or 0.1,
+            top_p=request.top_p or 0.9,
+            top_k=40,
+            stop=request.stop or ["</s>", "[INST]", "[/INST]"],
+            echo=False,
+            repeat_penalty=1.1
+        )
+        
+        await inference_queue.get()
+        
+        inference_duration = time.time() - inference_start
+        fastapi_inference_duration_seconds.labels(model="mixtral-8x7b").observe(inference_duration)
+        
+        prompt_tokens = response['usage']['prompt_tokens']
+        completion_tokens = response['usage']['completion_tokens']
+        
+        fastapi_inference_tokens_total.labels(type="prompt").inc(prompt_tokens)
+        fastapi_inference_tokens_total.labels(type="completion").inc(completion_tokens)
+        
+        if inference_duration > 0:
+            tps = completion_tokens / inference_duration
+            fastapi_inference_tokens_per_second.set(tps)
+            logging.info(f"[PERF] Génération: {tps:.1f} tokens/sec, {inference_duration:.2f}s total")
+        
+        # Utilise le parsing JSON intelligent
+        generated_text = response['choices'][0]['text'].strip()
+        
+        # Si on attend du JSON, applique le parsing intelligent
+        if request.response_format and request.response_format.get("type") == "json_object":
+            generated_text = ensure_json_response(generated_text, request.response_format)
             
-            # Validation du modèle
-            if llm is None:
-                await websocket.send_json({
-                    "type": "error",
-                    "error": "Model not loaded",
-                    "timestamp": int(time.time() * 1000)
-                })
-                streaming_errors.labels(error_type="model_not_loaded").inc()
-                continue
-            
+            # Vérifie si le parsing a réussi
             try:
-                # Parser la requête
-                messages = [Message(**msg) for msg in data.get("messages", [])]
-                if not messages:
-                    raise ValueError("No messages provided")
-                
-                request_id = data.get("request_id", f"req_{session.chunk_count}")
-                mode = data.get("mode", "conversational")
-                temperature = data.get("temperature", 0.7)
-                max_tokens = data.get("max_tokens", 200)
-                
-                logger.info(f"[STREAM {session_id}] Requête {request_id}, mode: {mode}")
-                
-                # Gérer la queue d'inférence
-                await inference_queue.put({"session_id": session_id, "request_id": request_id})
-                
-                try:
-                    # Formatter le prompt selon le mode
-                    if mode == "conversational":
-                        prompt = format_messages_for_streaming(messages, mode)
-                    else:
-                        prompt = format_messages_mistral(messages)
-                    
-                    # Réinitialiser la session pour cette requête
-                    session.start_time = time.time()
-                    session.first_token_time = None
-                    session.token_count = 0
-                    session.buffer = ""
-                    
-                    # Streamer la réponse
-                    stats = await stream_llm_response(
-                        prompt=prompt,
-                        session=session,
-                        temperature=temperature,
-                        max_tokens=max_tokens
-                    )
-                    
-                    # Métriques
-                    fastapi_inference_requests_total.labels(
-                        model="mixtral-8x7b", 
-                        status="success", 
-                        mode="streaming"
-                    ).inc()
-                    
-                    fastapi_inference_duration_seconds.labels(
-                        model="mixtral-8x7b", 
-                        mode="streaming"
-                    ).observe(stats["total_time"])
-                    
-                    fastapi_inference_tokens_total.labels(type="completion").inc(stats["total_tokens"])
-                    
-                    if stats["tokens_per_second"] > 0:
-                        fastapi_inference_tokens_per_second.set(stats["tokens_per_second"])
-                    
-                    logger.info(f"[STREAM {session_id}] Génération terminée: {stats['total_tokens']} tokens, {stats['tokens_per_second']:.1f} t/s")
-                    
-                finally:
-                    await inference_queue.get()
-                
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.error(f"[STREAM {session_id}] Erreur: {str(e)}")
-                logger.error(traceback.format_exc())
-                
-                streaming_errors.labels(error_type="processing_error").inc()
-                fastapi_inference_requests_total.labels(
-                    model="mixtral-8x7b", 
-                    status="error", 
-                    mode="streaming"
-                ).inc()
-                
-                await websocket.send_json({
-                    "type": "error",
-                    "error": str(e),
-                    "request_id": data.get("request_id"),
-                    "timestamp": int(time.time() * 1000)
-                })
-    
-    except WebSocketDisconnect:
-        logger.info(f"[STREAM {session_id}] Client déconnecté")
+                parsed = json.loads(generated_text)
+                if "error" in parsed and "original_response" in parsed:
+                    logging.warning(f"JSON parsing failed, returning error structure: {parsed['error']}")
+            except:
+                pass
+        
+        chat_response = ChatCompletionResponse(
+            id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
+            created=int(time.time()),
+            model=request.model,
+            choices=[Choice(
+                index=0,
+                message=Message(role="assistant", content=generated_text),
+                finish_reason=response['choices'][0]['finish_reason']
+            )],
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=response['usage']['total_tokens']
+            )
+        )
+        
+        fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
+        return chat_response
+        
+    except HTTPException:
+        status = "error"
+        raise
     except Exception as e:
-        logger.error(f"[STREAM {session_id}] Erreur WebSocket: {str(e)}")
-        streaming_errors.labels(error_type="websocket_error").inc()
+        status = "error"
+        fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="error").inc()
+        logging.error(f"Erreur lors de la génération: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
-        await session.close()
-        fastapi_websocket_connections.dec()
-        logger.info(f"[STREAM {session_id}] Session fermée")
+        fastapi_requests_total.labels(method="POST", endpoint="/v1/chat/completions", status=status).inc()
+        fastapi_request_duration_seconds.labels(method="POST", endpoint="/v1/chat/completions").observe(time.time() - start_time)
 
-# ===== WEBSOCKET HYBRIDE (streaming + JSON) =====
 @app.websocket("/ws")
-async def websocket_hybrid_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """
-    Endpoint WebSocket hybride : 
-    - Mode streaming pour les conversations
-    - Mode JSON pour extractions/résumés
-    Parfait pour Voximplant qui a besoin des deux
-    """
+async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
+    """Endpoint WebSocket avec parsing JSON intelligent"""
     if token != API_TOKEN:
         await websocket.close(code=1008, reason="Invalid token")
         return
     
     await websocket.accept()
     fastapi_websocket_connections.inc()
-    
-    session_id = f"hybrid_{uuid.uuid4().hex[:8]}"
-    logger.info(f"[WS-HYBRID {session_id}] Nouvelle connexion WebSocket hybride")
     
     welcome_msg = {
         "type": "connection",
         "status": "connected",
         "model": "mixtral-8x7b",
         "model_loaded": llm is not None,
-        "capabilities": ["streaming", "json", "extraction"],
-        "session_id": session_id,
-        "endpoints": {
-            "streaming": "Pour conversations naturelles (response_format: null ou text)",
-            "json": "Pour extraction/résumé (response_format: json)"
-        }
+        "capabilities": [
+            "French medical conversations",
+            "Structured JSON output",
+            "32K context",
+            "Intelligent JSON parsing"
+        ]
     }
     await websocket.send_json(welcome_msg)
     
     try:
         while True:
             data = await websocket.receive_json()
-            
             if llm is None:
                 await websocket.send_json({"type": "error", "error": "Model not loaded"})
+                fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="error").inc()
                 continue
             
             try:
-                # Déterminer le mode selon response_format
-                response_format = data.get("response_format", "text")
-                stream_mode = data.get("stream", True)
+                request = ChatCompletionRequest(
+                    messages=[Message(**msg) for msg in data.get("messages", [])],
+                    **{k: v for k, v in data.items() if k != "messages"}
+                )
+                await inference_queue.put(request)
                 
-                # Mode extraction/JSON : JAMAIS de streaming
-                if response_format == "json" or data.get("mode") == "extraction":
-                    logger.info(f"[WS-HYBRID {session_id}] Mode JSON/Extraction (pas de streaming)")
-                    
-                    # Créer la requête
-                    messages = [Message(**msg) for msg in data.get("messages", [])]
-                    
-                    await inference_queue.put({"session_id": session_id, "mode": "json"})
-                    
-                    try:
-                        # Pour l'extraction, on utilise toujours le prompt d'extraction
-                        if data.get("mode") == "extraction":
-                            prompt = format_messages_mistral([
-                                Message(role="system", content=LLM_CONFIG.EXTRACTION_PROMPT),
-                                Message(role="user", content=messages[0].content if messages else "")
-                            ])
-                        else:
-                            prompt = format_messages_mistral(messages)
-                        
-                        start_time = time.time()
-                        
-                        # Génération SANS streaming pour avoir la réponse complète
-                        response = llm(
-                            prompt,
-                            max_tokens=data.get("max_tokens", 500),  # Plus de tokens pour JSON
-                            temperature=data.get("temperature", 0.1),  # Température basse pour JSON
-                            top_p=0.9,
-                            top_k=40,
-                            stop=["</s>", "[INST]", "[/INST]"],
-                            echo=False,
-                            repeat_penalty=1.1,
-                            stream=False  # PAS de streaming pour JSON
-                        )
-                        
-                        elapsed = time.time() - start_time
-                        generated_text = response['choices'][0]['text'].strip()
-                        
-                        # Pour le mode extraction, nettoyer et parser le JSON
-                        if data.get("mode") == "extraction":
-                            # Extraire le JSON de la réponse
-                            json_str, _ = extract_json_from_text(generated_text)
-                            if json_str:
-                                try:
-                                    parsed_json = json.loads(json_str)
-                                    generated_text = json.dumps(parsed_json, ensure_ascii=False, indent=2)
-                                except:
-                                    pass
-                        
-                        # Envoyer la réponse complète
-                        response_msg = {
-                            "type": "completion",
-                            "choices": [{
-                                "message": {
-                                    "role": "assistant",
-                                    "content": generated_text
-                                },
-                                "finish_reason": response['choices'][0]['finish_reason']
-                            }],
-                            "usage": response['usage'],
-                            "time_ms": round(elapsed * 1000),
-                            "tokens_per_second": round(response['usage']['completion_tokens'] / elapsed, 2),
-                            "mode": "json",
-                            "request_id": data.get("request_id")
-                        }
-                        
-                        await websocket.send_json(response_msg)
-                        
-                        # Métriques
-                        fastapi_inference_requests_total.labels(
-                            model="mixtral-8x7b", 
-                            status="success", 
-                            mode="json"
-                        ).inc()
-                        
-                        logger.info(f"[WS-HYBRID {session_id}] Réponse JSON générée en {elapsed:.2f}s")
-                        
-                    finally:
-                        await inference_queue.get()
+                prompt = format_messages_mistral(request.messages)
                 
-                # Mode conversation : streaming activé par défaut
-                elif stream_mode and response_format != "json":
-                    logger.info(f"[WS-HYBRID {session_id}] Mode streaming conversationnel")
-                    
-                    session = StreamingSession(session_id, websocket)
-                    active_streams[session_id] = session
-                    
-                    try:
-                        messages = [Message(**msg) for msg in data.get("messages", [])]
-                        prompt = format_messages_for_streaming(messages, "conversational")
-                        
-                        await inference_queue.put({"session_id": session_id, "mode": "streaming"})
-                        
-                        stats = await stream_llm_response(
-                            prompt=prompt,
-                            session=session,
-                            temperature=data.get("temperature", 0.7),
-                            max_tokens=data.get("max_tokens", 200)
-                        )
-                        
-                        # Ajouter le request_id aux stats finales
-                        if "request_id" in data:
-                            await websocket.send_json({
-                                "type": "stream_complete",
-                                "request_id": data["request_id"],
-                                "stats": stats
-                            })
-                        
-                        await inference_queue.get()
-                        
-                        fastapi_inference_requests_total.labels(
-                            model="mixtral-8x7b", 
-                            status="success", 
-                            mode="streaming"
-                        ).inc()
-                        
-                    finally:
-                        await session.close()
+                # Ajoute le schéma JSON si fourni
+                if data.get("json_schema"):
+                    schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(data['json_schema'], indent=2)}"
+                    prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
                 
-                # Mode classique (compatibilité)
-                else:
-                    logger.info(f"[WS-HYBRID {session_id}] Mode classique (pas de streaming)")
-                    
-                    messages = [Message(**msg) for msg in data.get("messages", [])]
-                    prompt = format_messages_mistral(messages)
-                    
-                    await inference_queue.put({"session_id": session_id, "mode": "classic"})
-                    
-                    try:
-                        start_time = time.time()
-                        response = llm(
-                            prompt,
-                            max_tokens=data.get("max_tokens", 4096),
-                            temperature=data.get("temperature", 0.1),
-                            top_p=data.get("top_p", 0.9),
-                            top_k=40,
-                            stop=["</s>", "[INST]", "[/INST]"],
-                            echo=False,
-                            repeat_penalty=1.1,
-                            stream=False
-                        )
-                        
-                        elapsed = time.time() - start_time
-                        
-                        response_json = {
-                            "type": "completion",
-                            "choices": [{
-                                "message": {
-                                    "role": "assistant",
-                                    "content": response['choices'][0]['text'].strip()
-                                },
-                                "finish_reason": response['choices'][0]['finish_reason']
-                            }],
-                            "usage": response['usage'],
-                            "time_ms": round(elapsed * 1000),
-                            "tokens_per_second": round(response['usage']['completion_tokens'] / elapsed, 2),
-                            "mode": "classic"
-                        }
-                        
-                        if "request_id" in data:
-                            response_json["request_id"] = data["request_id"]
-                        
-                        await websocket.send_json(response_json)
-                        
-                        fastapi_inference_requests_total.labels(
-                            model="mixtral-8x7b", 
-                            status="success", 
-                            mode="classic"
-                        ).inc()
-                        
-                    finally:
-                        await inference_queue.get()
+                start_time = time.time()
+                response = llm(
+                    prompt,
+                    max_tokens=data.get("max_tokens", 4096),
+                    temperature=data.get("temperature", 0.1),
+                    top_p=data.get("top_p", 0.9),
+                    top_k=data.get("top_k", 40),
+                    stop=data.get("stop", ["</s>", "[INST]", "[/INST]"]),
+                    echo=False,
+                    repeat_penalty=1.1
+                )
+                await inference_queue.get()
+                elapsed = (time.time() - start_time) * 1000
+                inference_duration = elapsed / 1000.0
+
+                fastapi_inference_duration_seconds.labels(model="mixtral-8x7b").observe(inference_duration)
+                fastapi_inference_tokens_total.labels(type="prompt").inc(response['usage']['prompt_tokens'])
+                fastapi_inference_tokens_total.labels(type="completion").inc(response['usage']['completion_tokens'])
+
+                if inference_duration > 0:
+                    tps = response['usage']['completion_tokens'] / inference_duration
+                    fastapi_inference_tokens_per_second.set(tps)
+
+                generated_text = response['choices'][0]['text'].strip()
+                
+                # Applique le parsing JSON intelligent si nécessaire
+                if data.get("response_format") and data["response_format"].get("type") == "json_object":
+                    generated_text = ensure_json_response(generated_text, data.get("response_format"))
+
+                response_json = {
+                    "type": "completion",
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": generated_text
+                        },
+                        "finish_reason": response['choices'][0]['finish_reason']
+                    }],
+                    "usage": response['usage'],
+                    "time_ms": round(elapsed),
+                    "tokens_per_second": round(response['usage']['completion_tokens'] / (elapsed / 1000), 2)
+                }
+                
+                if "request_id" in data:
+                    response_json["request_id"] = data["request_id"]
+                
+                await websocket.send_json(response_json)
+                fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
                 
             except Exception as e:
-                logger.error(f"[WS-HYBRID {session_id}] Erreur: {str(e)}")
-                logger.error(traceback.format_exc())
-                
-                await websocket.send_json({
-                    "type": "error",
-                    "error": str(e),
-                    "request_id": data.get("request_id")
-                })
-                
-                fastapi_inference_requests_total.labels(
-                    model="mixtral-8x7b", 
-                    status="error", 
-                    mode="unknown"
-                ).inc()
+                logging.error(f"[WS] Erreur: {str(e)}", exc_info=True)
+                fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="error").inc()
+                error_response = {"type": "error", "error": str(e)}
+                if "request_id" in data:
+                    error_response["request_id"] = data["request_id"]
+                await websocket.send_json(error_response)
     
     except WebSocketDisconnect:
-        logger.info(f"[WS-HYBRID {session_id}] Client déconnecté")
+        logging.info("[WS] Client déconnecté")
     finally:
         fastapi_websocket_connections.dec()
-        if session_id in active_streams:
-            await active_streams[session_id].close()
 
 if __name__ == "__main__":
     import uvicorn
