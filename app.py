@@ -28,7 +28,7 @@ from llama_cpp import Llama
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
 
 ### MODIFIÉ ### Configuration pour Mixtral-8x7B
-MODEL_PATH = "/app/models/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf"
+MODEL_PATH = "/workspace/models/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf"
 MODEL_URL = "https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf"
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 
