@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 API FastAPI pour servir le modèle Mixtral-8x7B GGUF avec llama-cpp-python
-Optimisé pour conversations médicales françaises avec extraction JSON
-Télécharge automatiquement le modèle au premier démarrage
+Optimisé pour conversations médicales françaises avec extraction JSON AMÉLIORÉE
+Version avec parsing JSON intelligent et nettoyage automatique
 """
 import os
 import time
@@ -21,13 +21,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Tuple
 from llama_cpp import Llama
 
 # Import des métriques Prometheus
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
 
-### MODIFIÉ ### Configuration pour Mixtral-8x7B
+# Configuration pour Mixtral-8x7B
 MODEL_PATH = "/workspace/models/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf"
 MODEL_URL = "https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf"
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
@@ -39,17 +39,14 @@ logging.basicConfig(
 )
 
 # ===== MÉTRIQUES PROMETHEUS =====
-
-# Informations système ### MODIFIÉ ###
 system_info = Info('fastapi_system', 'System information')
 system_info.info({
     'model': 'mixtral-8x7b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '3.0.0' # Version applicative
+    'version': '4.0.0'  # Version avec JSON amélioré
 })
 
-# ... (le reste des métriques reste identique)
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
 gpu_memory_used_bytes = Gauge('gpu_memory_used_bytes', 'GPU memory used in bytes')
 gpu_memory_total_bytes = Gauge('gpu_memory_total_bytes', 'GPU memory total in bytes')
@@ -65,16 +62,19 @@ fastapi_websocket_connections = Gauge('fastapi_websocket_connections', 'Number o
 fastapi_inference_requests_total = Counter('fastapi_inference_requests_total', 'Total number of inference requests', ['model', 'status'])
 fastapi_inference_duration_seconds = Histogram('fastapi_inference_duration_seconds', 'Inference duration in seconds', ['model'], buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0])
 fastapi_inference_queue_size = Gauge('fastapi_inference_queue_size', 'Current inference queue size')
-fastapi_inference_tokens_total = Counter('fastapi_inference_tokens_total', 'Total tokens processed', ['type'])  # prompt, completion
+fastapi_inference_tokens_total = Counter('fastapi_inference_tokens_total', 'Total tokens processed', ['type'])
 fastapi_inference_tokens_per_second = Gauge('fastapi_inference_tokens_per_second', 'Tokens generated per second')
 model_loaded = Gauge('model_loaded', 'Whether the model is loaded (1) or not (0)')
 model_loading_duration_seconds = Gauge('model_loading_duration_seconds', 'Time taken to load the model')
 model_download_progress = Gauge('model_download_progress', 'Model download progress in percentage')
+json_parse_success_total = Counter('json_parse_success_total', 'Number of successful JSON parses')
+json_parse_failure_total = Counter('json_parse_failure_total', 'Number of failed JSON parses')
+
 inference_queue = asyncio.Queue(maxsize=1000)
 download_in_progress = False
 download_complete = False
 
-# ... (les fonctions de métriques update_gpu_metrics, update_system_metrics, metrics_update_task restent identiques)
+# ===== FONCTIONS DE MÉTRIQUES =====
 def update_gpu_metrics():
     try:
         import pynvml
@@ -113,12 +113,172 @@ async def metrics_update_task():
         fastapi_inference_queue_size.set(inference_queue.qsize())
         await asyncio.sleep(5)
 
-# ===== CODE PRINCIPAL =====
+# ===== PARSING JSON AMÉLIORÉ =====
 
-# Sécurité
-security = HTTPBearer()
+def clean_escaped_json(text: str) -> str:
+    """Nettoie les caractères d'échappement dans le JSON"""
+    # Remplace les underscores échappés
+    text = text.replace(r'\_', '_')
+    # Remplace les doubles backslashes
+    text = text.replace('\\\\', '\\')
+    # Nettoie les espaces et retours à la ligne excessifs
+    text = re.sub(r'\n\s*\n', '\n', text)
+    return text
 
-# Modèles Pydantic ### MODIFIÉ ###
+def extract_json_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Extrait le JSON d'un texte et retourne (json_str, remaining_text)
+    Version améliorée qui gère plusieurs formats
+    """
+    text = text.strip()
+    
+    # Nettoie d'abord les échappements
+    text = clean_escaped_json(text)
+    
+    # Cas 1: Le texte commence et finit par des accolades
+    if text.startswith('{') and text.endswith('}'):
+        return text, None
+    
+    # Cas 2: JSON dans des balises code
+    json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+    if json_match:
+        json_str = json_match.group(1).strip()
+        remaining = text[:json_match.start()] + text[json_match.end():]
+        return json_str, remaining.strip() if remaining.strip() else None
+    
+    # Cas 3: JSON avec un préfixe (JSON:, json:, etc.)
+    json_prefix_match = re.search(r'(?:JSON|json|Json):\s*({.*?})', text, re.DOTALL)
+    if json_prefix_match:
+        json_str = json_prefix_match.group(1)
+        remaining = text[:json_prefix_match.start()] + text[json_prefix_match.end():]
+        return json_str, remaining.strip() if remaining.strip() else None
+    
+    # Cas 4: Cherche la première accolade ouvrante et la dernière fermante
+    start = text.find('{')
+    if start != -1:
+        # Compte les accolades pour trouver la fin correcte
+        count = 0
+        end = -1
+        for i in range(start, len(text)):
+            if text[i] == '{':
+                count += 1
+            elif text[i] == '}':
+                count -= 1
+                if count == 0:
+                    end = i
+                    break
+        
+        if end != -1:
+            json_str = text[start:end+1]
+            remaining = text[:start] + text[end+1:]
+            return json_str, remaining.strip() if remaining.strip() else None
+    
+    # Cas 5: Pas de JSON trouvé
+    return None, text
+
+def smart_json_parse(text: str) -> Dict[str, Any]:
+    """
+    Parse intelligent du JSON avec plusieurs stratégies de récupération
+    """
+    original_text = text
+    
+    # Étape 1: Extraction du JSON
+    json_str, remaining_text = extract_json_from_text(text)
+    
+    if not json_str:
+        logging.warning("Aucun JSON trouvé dans la réponse")
+        json_parse_failure_total.inc()
+        return {
+            "error": "No JSON found in response",
+            "original_response": original_text
+        }
+    
+    # Étape 2: Tentative de parsing direct
+    try:
+        result = json.loads(json_str)
+        json_parse_success_total.inc()
+        
+        # Si il y a du texte supplémentaire, on peut l'ajouter comme metadata
+        if remaining_text:
+            result["_metadata"] = {
+                "additional_text": remaining_text,
+                "json_extracted": True
+            }
+        
+        return result
+    except json.JSONDecodeError as e:
+        logging.warning(f"Première tentative de parsing échouée: {e}")
+    
+    # Étape 3: Nettoyage et nouvelle tentative
+    # Retire les commentaires style //
+    json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
+    # Retire les virgules trailing
+    json_str = re.sub(r',\s*}', '}', json_str)
+    json_str = re.sub(r',\s*]', ']', json_str)
+    
+    try:
+        result = json.loads(json_str)
+        json_parse_success_total.inc()
+        
+        if remaining_text:
+            result["_metadata"] = {
+                "additional_text": remaining_text,
+                "json_extracted": True,
+                "required_cleanup": True
+            }
+        
+        return result
+    except json.JSONDecodeError as e:
+        logging.warning(f"Deuxième tentative échouée: {e}")
+    
+    # Étape 4: Tentative de réparation avec regex
+    # Essaie de corriger les clés sans guillemets
+    json_str = re.sub(r'(\w+):', r'"\1":', json_str)
+    # Corrige les valeurs true/false/null
+    json_str = re.sub(r'\btrue\b', 'true', json_str, flags=re.IGNORECASE)
+    json_str = re.sub(r'\bfalse\b', 'false', json_str, flags=re.IGNORECASE)
+    json_str = re.sub(r'\bnull\b', 'null', json_str, flags=re.IGNORECASE)
+    
+    try:
+        result = json.loads(json_str)
+        json_parse_success_total.inc()
+        
+        if remaining_text:
+            result["_metadata"] = {
+                "additional_text": remaining_text,
+                "json_extracted": True,
+                "heavy_cleanup": True
+            }
+        
+        return result
+    except json.JSONDecodeError as e:
+        logging.error(f"Toutes les tentatives de parsing ont échoué: {e}")
+        json_parse_failure_total.inc()
+        
+        # Retourne une structure d'erreur
+        return {
+            "error": "JSON parsing failed after all attempts",
+            "original_response": original_text,
+            "attempted_json": json_str,
+            "parse_error": str(e)
+        }
+
+def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> str:
+    """
+    S'assure que la réponse est un JSON valide
+    """
+    if request_format and request_format.get("type") == "json_object":
+        parsed = smart_json_parse(text)
+        
+        # Nettoie les metadata si elles existent
+        if "_metadata" in parsed and not os.getenv("DEBUG_MODE"):
+            del parsed["_metadata"]
+        
+        return json.dumps(parsed, ensure_ascii=False, indent=2)
+    
+    return text
+
+# ===== MODÈLES PYDANTIC =====
 class Message(BaseModel):
     role: str
     content: str
@@ -132,6 +292,7 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
     response_format: Optional[Dict[str, str]] = None
+    json_schema: Optional[Dict[str, Any]] = None  # Pour forcer un schéma spécifique
 
 class Usage(BaseModel):
     prompt_tokens: int
@@ -154,6 +315,9 @@ class ChatCompletionResponse(BaseModel):
 # Variable globale pour le modèle
 llm = None
 
+# ===== AUTHENTIFICATION =====
+security = HTTPBearer()
+
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Vérifier le token Bearer"""
     if credentials.credentials != API_TOKEN:
@@ -164,13 +328,13 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         )
     return credentials.credentials
 
+# ===== GESTION DU MODÈLE =====
 def download_model_if_needed():
     """Télécharger le modèle au premier démarrage si nécessaire"""
     global download_in_progress, download_complete
     
     if os.path.exists(MODEL_PATH):
         file_size = os.path.getsize(MODEL_PATH)
-        ### MODIFIÉ ### Vérification de la taille pour Mixtral (>30GB)
         if file_size > 30_000_000_000:
             print(f"Modèle trouvé: {file_size / (1024**3):.1f} GB")
             download_complete = True
@@ -184,7 +348,6 @@ def download_model_if_needed():
         return
     
     download_in_progress = True
-    ### MODIFIÉ ### Messages pour Mixtral
     print(f"Téléchargement du modèle Mixtral-8x7B... (~32.9 GB)")
     print(f"URL: {MODEL_URL}")
     print("Cela peut prendre 20-40 minutes selon votre connexion...")
@@ -213,7 +376,6 @@ def download_model_if_needed():
         file_size = os.path.getsize(MODEL_PATH)
         print(f"Taille du fichier: {file_size / (1024**3):.1f} GB")
         
-        ### MODIFIÉ ### Vérification de la taille pour Mixtral
         if file_size < 30_000_000_000:
             raise Exception(f"Fichier trop petit: {file_size} bytes")
         
@@ -230,7 +392,6 @@ def download_model_if_needed():
     finally:
         download_in_progress = False
 
-### MODIFIÉ ### Fonction de chargement pour Mixtral-8x7B
 def load_model():
     """Charger le modèle GGUF avec configuration optimale pour Mixtral-8x7B"""
     global llm
@@ -247,12 +408,11 @@ def load_model():
         vram_gb = mem_info.total / (1024**3)
         print(f"VRAM disponible: {vram_gb:.1f} GB")
         
-        # Adapter les couches GPU pour Mixtral (plus gourmand)
         if vram_gb >= 40:
-            n_gpu_layers = -1  # Tout sur GPU
+            n_gpu_layers = -1
             print("Configuration: Modèle entièrement sur GPU (recommandé)")
         elif vram_gb >= 24:
-            n_gpu_layers = 28  # Bon compromis pour 24GB de VRAM (ex: RTX 4090)
+            n_gpu_layers = 28
             print("Configuration: 28 couches sur GPU")
         else:
             n_gpu_layers = 16
@@ -261,15 +421,14 @@ def load_model():
         n_gpu_layers = -1
         print(f"Impossible de détecter la VRAM ({e}), tentative de chargement complet sur GPU")
     
-    # Configuration pour Mixtral
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=32768,          # Mixtral supporte 32k de contexte
-        n_threads=12,         # Adapter au nombre de coeurs CPU disponibles
+        n_ctx=32768,
+        n_threads=12,
         n_gpu_layers=n_gpu_layers,
         n_batch=512,
         use_mmap=True,
-        use_mlock=False,      # Mieux pour les gros modèles
+        use_mlock=False,
         verbose=True,
         seed=42
     )
@@ -277,73 +436,47 @@ def load_model():
     print("Modèle Mixtral-8x7B chargé avec succès!")
     print(f"Configuration: {n_gpu_layers} couches GPU, contexte 32K tokens")
 
-### MODIFIÉ ### Nouvelle fonction de formatage pour Mistral
 def format_messages_mistral(messages: List[Message]) -> str:
-    """Formater les messages pour Mistral (format [INST])"""
+    """Formater les messages pour Mistral avec support JSON amélioré"""
     prompt_parts = ["<s>"]
     has_system_prompt = False
     
-    # Gérer le system prompt (Mistral le préfère au début, avant le premier [INST])
+    # Ajoute automatiquement une instruction pour le JSON si nécessaire
+    json_instruction = """You are a helpful assistant that ALWAYS responds with valid JSON.
+Your response must be ONLY the JSON object, with no additional text before or after.
+Do not include any explanations, comments, or markdown formatting.
+Just return the raw JSON object."""
+    
+    # Gérer le system prompt
     if messages and messages[0].role == "system":
-        prompt_parts.append(f"{messages[0].content}\n\n")
+        # Combine le system prompt existant avec l'instruction JSON
+        system_content = messages[0].content
+        if "json" in system_content.lower() or "JSON" in system_content:
+            prompt_parts.append(f"{system_content}\n\n")
+        else:
+            prompt_parts.append(f"{system_content}\n\n{json_instruction}\n\n")
         messages = messages[1:]
+        has_system_prompt = True
+    else:
+        # Ajoute l'instruction JSON comme system prompt
+        prompt_parts.append(f"{json_instruction}\n\n")
         has_system_prompt = True
 
     for i, message in enumerate(messages):
         if message.role == "user":
-            # Si c'est le premier message utilisateur, le format est légèrement différent
             if i == 0 and not has_system_prompt:
-                 prompt_parts.append(f"[INST] {message.content} [/INST]")
+                prompt_parts.append(f"[INST] {message.content} [/INST]")
             else:
                 prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
         elif message.role == "assistant":
-            # La réponse de l'assistant suit directement le [/INST]
             prompt_parts.append(f" {message.content}</s>")
             
-    # S'assurer que le prompt se termine prêt pour la réponse de l'assistant
     if not prompt_parts[-1].strip().endswith("</s>"):
-         prompt_parts.append(" ") # On attend la réponse de l'assistant
+        prompt_parts.append(" ")
 
     return "".join(prompt_parts)
 
-# ... (les fonctions extract_json_from_text, clean_and_parse_json, ensure_json_response restent identiques)
-def extract_json_from_text(text: str) -> str:
-    text = text.strip()
-    if text.startswith('{') and text.endswith('}'):
-        return text
-    start = text.find('{')
-    end = text.rfind('}')
-    if start != -1 and end != -1 and end > start:
-        return text[start:end+1]
-    json_match = re.search(r'```json\s*(.*?)\s*```', text, re.DOTALL)
-    if json_match:
-        return json_match.group(1)
-    json_prefix_match = re.search(r'(?:JSON|json|Json):\s*({.*})', text, re.DOTALL)
-    if json_prefix_match:
-        return json_prefix_match.group(1)
-    return text
-
-def clean_and_parse_json(text: str) -> Optional[Dict]:
-    text = extract_json_from_text(text)
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        return None
-
-def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> str:
-    if request_format and request_format.get("type") == "json_object":
-        parsed = clean_and_parse_json(text)
-        if parsed:
-            return json.dumps(parsed, ensure_ascii=False, indent=2)
-        else:
-            return json.dumps({
-                "response": text,
-                "error": "Could not parse as valid JSON."
-            }, ensure_ascii=False)
-    return text
-
-
-# ===== LIFESPAN POUR GÉRER LE CYCLE DE VIE =====
+# ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestion du cycle de vie de l'application"""
@@ -369,11 +502,11 @@ async def lifespan(app: FastAPI):
     except asyncio.CancelledError:
         pass
 
-# Initialisation de l'application avec lifespan ### MODIFIÉ ###
+# ===== APPLICATION FASTAPI =====
 app = FastAPI(
     title="Mixtral-8x7B GGUF API",
-    version="3.0.0",
-    description="API FastAPI pour Mixtral-8x7B optimisée pour conversations médicales françaises avec JSON structuré",
+    version="4.0.0",
+    description="API FastAPI pour Mixtral-8x7B avec parsing JSON intelligent",
     lifespan=lifespan
 )
 
@@ -385,7 +518,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ... (L'endpoint /metrics reste identique)
+# ===== ENDPOINTS =====
+
 @app.get("/metrics")
 async def metrics():
     update_gpu_metrics()
@@ -394,14 +528,19 @@ async def metrics():
 
 @app.get("/")
 async def root():
-    ### MODIFIÉ ###
     return {
-        "message": "Mixtral-8x7B GGUF API",
+        "message": "Mixtral-8x7B GGUF API with Smart JSON Parsing",
         "status": "running" if llm is not None else "loading",
         "model": "Mixtral-8x7B-Instruct-v0.1.Q5_K_M.gguf",
         "model_loaded": llm is not None,
         "download_complete": download_complete,
         "download_in_progress": download_in_progress,
+        "features": [
+            "Intelligent JSON parsing",
+            "Automatic escape character cleanup",
+            "Multiple JSON extraction strategies",
+            "Structured error responses"
+        ],
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
             "/ws": "WebSocket - Chat endpoint (requires token in query)",
@@ -412,7 +551,6 @@ async def root():
         }
     }
 
-# ... (Les endpoints /health, /download-status restent fonctionnellement identiques)
 @app.get("/health")
 async def health_check():
     health_status = {
@@ -421,7 +559,11 @@ async def health_check():
         "model_path": MODEL_PATH,
         "model_exists": os.path.exists(MODEL_PATH),
         "download_complete": download_complete,
-        "download_in_progress": download_in_progress
+        "download_in_progress": download_in_progress,
+        "json_parse_stats": {
+            "success": json_parse_success_total._value._value if hasattr(json_parse_success_total, '_value') else 0,
+            "failure": json_parse_failure_total._value._value if hasattr(json_parse_failure_total, '_value') else 0
+        }
     }
     if os.path.exists(MODEL_PATH):
         health_status["model_size"] = f"{os.path.getsize(MODEL_PATH) / (1024**3):.1f} GB"
@@ -444,7 +586,6 @@ async def download_status():
 async def list_models():
     start_time = time.time()
     try:
-        ### MODIFIÉ ###
         result = {
             "object": "list",
             "data": [
@@ -470,7 +611,7 @@ async def list_models():
 
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_token)])
 async def chat_completions(request: ChatCompletionRequest):
-    """Endpoint compatible OpenAI optimisé pour Mixtral et outputs structurés"""
+    """Endpoint compatible OpenAI avec parsing JSON intelligent"""
     start_time = time.time()
     status = "success"
     
@@ -483,22 +624,23 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         await inference_queue.put(request)
         
-        ### MODIFIÉ ### Utilisation du format Mistral
+        # Formatte le prompt avec support JSON amélioré
         prompt = format_messages_mistral(request.messages)
         
-        # Le format JSON est mieux géré par une instruction claire dans le prompt pour Mistral
-        # que par un paramètre `grammar`. On peut l'ajouter au dernier message utilisateur.
+        # Si un schéma JSON est fourni, l'ajoute au prompt
+        if request.json_schema:
+            schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(request.json_schema, indent=2)}"
+            prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
         
         inference_start = time.time()
         
-        ### MODIFIÉ ### Paramètres optimisés pour Mixtral
         response = llm(
             prompt,
             max_tokens=request.max_tokens or 4096,
             temperature=request.temperature or 0.1,
-            top_p=request.top_p or 0.9, # Mistral fonctionne bien avec un top_p plus élevé
+            top_p=request.top_p or 0.9,
             top_k=40,
-            stop=request.stop or ["</s>", "[INST]", "[/INST]"], # Tokens d'arrêt pour Mistral
+            stop=request.stop or ["</s>", "[INST]", "[/INST]"],
             echo=False,
             repeat_penalty=1.1
         )
@@ -517,17 +659,37 @@ async def chat_completions(request: ChatCompletionRequest):
         if inference_duration > 0:
             tps = completion_tokens / inference_duration
             fastapi_inference_tokens_per_second.set(tps)
-            print(f"[PERF] Génération: {tps:.1f} tokens/sec, {inference_duration:.2f}s total")
+            logging.info(f"[PERF] Génération: {tps:.1f} tokens/sec, {inference_duration:.2f}s total")
         
+        # Utilise le parsing JSON intelligent
         generated_text = response['choices'][0]['text'].strip()
-        generated_text = ensure_json_response(generated_text, request.response_format)
+        
+        # Si on attend du JSON, applique le parsing intelligent
+        if request.response_format and request.response_format.get("type") == "json_object":
+            generated_text = ensure_json_response(generated_text, request.response_format)
+            
+            # Vérifie si le parsing a réussi
+            try:
+                parsed = json.loads(generated_text)
+                if "error" in parsed and "original_response" in parsed:
+                    logging.warning(f"JSON parsing failed, returning error structure: {parsed['error']}")
+            except:
+                pass
         
         chat_response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             created=int(time.time()),
             model=request.model,
-            choices=[Choice(index=0, message=Message(role="assistant", content=generated_text), finish_reason=response['choices'][0]['finish_reason'])],
-            usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens, total_tokens=response['usage']['total_tokens'])
+            choices=[Choice(
+                index=0,
+                message=Message(role="assistant", content=generated_text),
+                finish_reason=response['choices'][0]['finish_reason']
+            )],
+            usage=Usage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=response['usage']['total_tokens']
+            )
         )
         
         fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
@@ -545,12 +707,9 @@ async def chat_completions(request: ChatCompletionRequest):
         fastapi_requests_total.labels(method="POST", endpoint="/v1/chat/completions", status=status).inc()
         fastapi_request_duration_seconds.labels(method="POST", endpoint="/v1/chat/completions").observe(time.time() - start_time)
 
-# ====== ENDPOINT WEBSOCKET ======
-# ... Le WebSocket reste identique en structure mais les appels internes sont modifiés.
-
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """Endpoint WebSocket pour les complétions de chat avec Mixtral"""
+    """Endpoint WebSocket avec parsing JSON intelligent"""
     if token != API_TOKEN:
         await websocket.close(code=1008, reason="Invalid token")
         return
@@ -558,13 +717,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     await websocket.accept()
     fastapi_websocket_connections.inc()
     
-    ### MODIFIÉ ### Message de bienvenue pour Mixtral
     welcome_msg = {
         "type": "connection",
         "status": "connected",
         "model": "mixtral-8x7b",
         "model_loaded": llm is not None,
-        "capabilities": ["French medical conversations", "Structured JSON output", "32K context"]
+        "capabilities": [
+            "French medical conversations",
+            "Structured JSON output",
+            "32K context",
+            "Intelligent JSON parsing"
+        ]
     }
     await websocket.send_json(welcome_msg)
     
@@ -577,11 +740,18 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 continue
             
             try:
-                request = ChatCompletionRequest(messages=[Message(**msg) for msg in data.get("messages", [])], **{k: v for k, v in data.items() if k != "messages"})
+                request = ChatCompletionRequest(
+                    messages=[Message(**msg) for msg in data.get("messages", [])],
+                    **{k: v for k, v in data.items() if k != "messages"}
+                )
                 await inference_queue.put(request)
                 
-                ### MODIFIÉ ###
                 prompt = format_messages_mistral(request.messages)
+                
+                # Ajoute le schéma JSON si fourni
+                if data.get("json_schema"):
+                    schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(data['json_schema'], indent=2)}"
+                    prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
                 
                 start_time = time.time()
                 response = llm(
@@ -607,15 +777,25 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     fastapi_inference_tokens_per_second.set(tps)
 
                 generated_text = response['choices'][0]['text'].strip()
-                generated_text = ensure_json_response(generated_text, data.get("response_format"))
+                
+                # Applique le parsing JSON intelligent si nécessaire
+                if data.get("response_format") and data["response_format"].get("type") == "json_object":
+                    generated_text = ensure_json_response(generated_text, data.get("response_format"))
 
                 response_json = {
                     "type": "completion",
-                    "choices": [{"message": {"role": "assistant", "content": generated_text}, "finish_reason": response['choices'][0]['finish_reason']}],
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": generated_text
+                        },
+                        "finish_reason": response['choices'][0]['finish_reason']
+                    }],
                     "usage": response['usage'],
                     "time_ms": round(elapsed),
                     "tokens_per_second": round(response['usage']['completion_tokens'] / (elapsed / 1000), 2)
                 }
+                
                 if "request_id" in data:
                     response_json["request_id"] = data["request_id"]
                 
@@ -631,7 +811,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 await websocket.send_json(error_response)
     
     except WebSocketDisconnect:
-        print("[WS] Client déconnecté")
+        logging.info("[WS] Client déconnecté")
     finally:
         fastapi_websocket_connections.dec()
 

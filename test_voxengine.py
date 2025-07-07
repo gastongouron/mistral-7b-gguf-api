@@ -11,7 +11,7 @@ from typing import Dict, List, Tuple, Optional
 from datetime import datetime
 
 # Configuration
-API_URL = "https://znl5igiucgckhh-8000.proxy.runpod.net"
+API_URL = "https://o03lttcfp3plx8-8000.proxy.runpod.net"
 API_TOKEN = "supersecret"
 HEADERS = {
     "Authorization": f"Bearer {API_TOKEN}",
