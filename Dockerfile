@@ -38,18 +38,18 @@ RUN mkdir -p /app/models
 # Copier l'application
 COPY app.py /app/
 
-# Informations sur l'image
+# Informations sur l'image ### MODIFIÉ ###
 RUN echo "=== Docker image build completed ===" && \
-    echo "Model: Qwen2.5-14B-Instruct will be downloaded on first start" && \
-    echo "Download size: ~8.1 GB" && \
+    echo "Model: Mixtral-8x7B-Instruct will be downloaded on first start" && \
+    echo "Download size: ~32.9 GB" && \
     echo "API will be available on port 8000 after model download" && \
     echo "Metrics available at /metrics endpoint"
 
 # Exposer le port
 EXPOSE 8000
 
-# Commande de démarrage
-CMD echo "Starting Qwen2.5-14B API server..." && \
-    echo "Note: Model will be downloaded on first start (~8.1 GB)" && \
-    echo "This may take 10-20 minutes depending on connection speed" && \
+# Commande de démarrage ### MODIFIÉ ###
+CMD echo "Starting Mixtral-8x7B API server..." && \
+    echo "Note: Model will be downloaded on first start (~32.9 GB)" && \
+    echo "This may take 20-40 minutes depending on connection speed" && \
     uvicorn app:app --host 0.0.0.0 --port 8000
