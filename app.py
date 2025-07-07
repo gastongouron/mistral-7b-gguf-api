@@ -15,6 +15,7 @@ import psutil
 import socket
 import urllib.request
 import sys
+import subprocess
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -332,7 +333,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 5):
     """Télécharge avec retry et gestion des erreurs 429"""
     import urllib.error
-    import subprocess
     
     # Récupérer le token depuis les variables d'environnement
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
