@@ -329,6 +329,107 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     return credentials.credentials
 
 # ===== GESTION DU MODÈLE =====
+def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 5):
+    """Télécharge avec retry et gestion des erreurs 429"""
+    import urllib.error
+    import subprocess
+    
+    # Récupérer le token depuis les variables d'environnement
+    hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    
+    if not hf_token:
+        print("⚠️  ATTENTION: Pas de token HuggingFace trouvé!")
+        print("   Définissez la variable HF_TOKEN pour éviter les erreurs 429")
+        print("   export HF_TOKEN='votre_token_ici'")
+    
+    # Essayer huggingface-cli en premier si token disponible
+    if hf_token and subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0:
+        print("🔑 Token HuggingFace détecté, utilisation de huggingface-cli...")
+        try:
+            # D'abord, configurer le token
+            subprocess.run(["huggingface-cli", "login", "--token", hf_token], 
+                         capture_output=True, check=True)
+            
+            # Puis télécharger
+            hf_cmd = [
+                "huggingface-cli", "download",
+                "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF",
+                "mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf",
+                "--local-dir", os.path.dirname(dest),
+                "--local-dir-use-symlinks", "False"
+            ]
+            
+            print("📥 Téléchargement avec huggingface-cli...")
+            result = subprocess.run(hf_cmd, text=True)
+            if result.returncode == 0:
+                print("✅ Téléchargement réussi avec huggingface-cli!")
+                return True
+            else:
+                print(f"⚠️ Échec huggingface-cli, tentative avec méthodes alternatives...")
+        except Exception as e:
+            print(f"⚠️ Erreur avec huggingface-cli: {e}")
+    
+    # Fallback sur les méthodes classiques
+    for attempt in range(max_retries):
+        try:
+            if attempt > 0:
+                wait_time = delay * (2 ** attempt)
+                print(f"\n⏳ Attente de {wait_time}s avant nouvelle tentative...")
+                time.sleep(wait_time)
+            
+            print(f"\n📥 Tentative {attempt + 1}/{max_retries}")
+            
+            # Headers avec token si disponible
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            }
+            if hf_token:
+                headers['Authorization'] = f'Bearer {hf_token}'
+                print("🔑 Utilisation du token HF dans les headers")
+            
+            request = urllib.request.Request(url, headers=headers)
+            
+            def download_progress(block_num, block_size, total_size):
+                downloaded = block_num * block_size
+                percent = min(downloaded * 100 / total_size, 100)
+                mb_downloaded = downloaded / 1024 / 1024
+                mb_total = total_size / 1024 / 1024
+                model_download_progress.set(percent)
+                sys.stdout.write(f'\rTéléchargement: {percent:.1f}% ({mb_downloaded:.1f}/{mb_total:.1f} MB) ')
+                sys.stdout.flush()
+            
+            urllib.request.urlretrieve(request.full_url, dest, reporthook=download_progress)
+            print("\n✅ Téléchargement réussi!")
+            return True
+            
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print(f"\n⚠️ Erreur 429: Limite de taux dépassée")
+                if not hf_token:
+                    print("💡 Conseil: Définissez HF_TOKEN pour éviter cette erreur")
+                if attempt < max_retries - 1:
+                    continue
+            else:
+                print(f"\n❌ Erreur HTTP {e.code}: {e.reason}")
+                if attempt < max_retries - 1:
+                    continue
+                raise
+    
+    # Dernière tentative avec wget
+    print("\n🔧 Tentative finale avec wget...")
+    try:
+        wget_cmd = ["wget", "-c", "-O", dest, url]
+        if hf_token:
+            wget_cmd.extend(["--header", f"Authorization: Bearer {hf_token}"])
+        subprocess.run(wget_cmd, check=True)
+        return True
+    except:
+        print("\n❌ Toutes les tentatives ont échoué")
+        if not hf_token:
+            print("\n💡 Solution: Définissez la variable d'environnement HF_TOKEN")
+            print("   export HF_TOKEN='votre_token_huggingface'")
+        return False
+
 def download_model_if_needed():
     """Télécharger le modèle au premier démarrage si nécessaire"""
     global download_in_progress, download_complete
@@ -336,45 +437,62 @@ def download_model_if_needed():
     if os.path.exists(MODEL_PATH):
         file_size = os.path.getsize(MODEL_PATH)
         if file_size > 30_000_000_000:
-            print(f"Modèle trouvé: {file_size / (1024**3):.1f} GB")
+            print(f"✅ Modèle trouvé: {file_size / (1024**3):.1f} GB")
             download_complete = True
             return
         else:
-            print(f"Modèle incomplet ({file_size / (1024**3):.1f} GB), re-téléchargement...")
-            os.remove(MODEL_PATH)
+            print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")
+            # Ne pas supprimer, wget peut reprendre
     
     if download_in_progress:
-        print("Téléchargement déjà en cours...")
+        print("⏳ Téléchargement déjà en cours...")
         return
     
     download_in_progress = True
-    print(f"Téléchargement du modèle Mixtral-8x7B... (~32.9 GB)")
-    print(f"URL: {MODEL_URL}")
-    print("Cela peut prendre 20-40 minutes selon votre connexion...")
+    
+    # URLs alternatives avec différentes méthodes
+    urls = [
+        MODEL_URL,
+        # Tentative avec paramètre download
+        "https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf?download=true",
+        # Via CDN alternatif (si disponible)
+        "https://cdn-lfs.huggingface.co/repos/47/23/4723e5fff847c49ee1a4b5056cf1aec01e866c8f7e09c0d8bb8e9b4ad27e2659/4aa8069d24261fd1da11dd0e5f5b0b7f5fe7bd20397cd72e8d4686cbcb6ee72d?response-content-disposition=attachment%3B+filename*%3DUTF-8%27%27mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf%3B+filename%3D%22mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf%22%3B&response-content-type=application%2Foctet-stream&Expires=1720612362&Policy=eyJTdGF0ZW1lbnQiOlt7IkNvbmRpdGlvbiI6eyJEYXRlTGVzc1RoYW4iOnsiQVdTOkVwb2NoVGltZSI6MTcyMDYxMjM2Mn19LCJSZXNvdXJjZSI6Imh0dHBzOi8vY2RuLWxmcy5odWdnaW5nZmFjZS5jby9yZXBvcy80Ny8yMy80NzIzZTVmZmY4NDdjNDllZTFhNGI1MDU2Y2YxYWVjMDFlODY2YzhmN2UwOWMwZDhiYjhlOWI0YWQyN2UyNjU5LzRhYTgwNjlkMjQyNjFmZDFkYTExZGQwZTVmNWIwYjdmNWZlN2JkMjAzOTdjZDcyZThkNDY4NmNiY2I2ZWU3MmQ%7EcmVzcG9uc2UtY29udGVudC1kaXNwb3NpdGlvbj0qJnJlc3BvbnNlLWNvbnRlbnQtdHlwZT0qIn1dfQ__&Signature=aBqZVyARPNPTWRD8ZH9sM0oAl6fTXFNWYVTcf87jmvqXgwBQCqGOgPQ3oVwZa0OKuLgqKVQZGCV7KCJH8pdcCa2hBhwkMJdqGBOiNqtFc-y6aOEk6bhZUE-KvYjMBnQZJo8T8HBNsAqSacBnxNFg3SLPJoqOx6Fwf6R8JgAepbRMhGRWEQs9l7ItnKlBKSxvASMRaM8LhVgeLCMvTTdCN93ruBu4eMBV2TvaZVocDAXFH2iKvYpG7kkUenIs8KiVxAMtBb0pFfaM8hNxGpu4xVz40fQY1lDijkiESYqcCq9sNQgvJYACtj9k-lQgH0VxaL0rT4dve9MhnqKf3AiWMA__&Key-Pair-Id=KVTP0A1DKRTAX",
+    ]
+    
+    # Essayer aussi avec huggingface-cli si disponible
+    hf_cli_available = subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0
+    
+    print(f"\n{'='*60}")
+    print(f"📥 TÉLÉCHARGEMENT DU MODÈLE MIXTRAL-8X7B")
+    print(f"{'='*60}")
+    print(f"📦 Taille: ~32.9 GB")
+    print(f"📍 Destination: {MODEL_PATH}")
+    print(f"⏱️ Temps estimé: 20-40 minutes")
+    print(f"{'='*60}\n")
     
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
     
-    def download_progress(block_num, block_size, total_size):
-        downloaded = block_num * block_size
-        percent = min(downloaded * 100 / total_size, 100)
-        mb_downloaded = downloaded / 1024 / 1024
-        mb_total = total_size / 1024 / 1024
-        model_download_progress.set(percent)
-        sys.stdout.write(f'\rTéléchargement: {percent:.1f}% ({mb_downloaded:.1f}/{mb_total:.1f} MB) ')
-        sys.stdout.flush()
-        if int(percent) % 10 == 0 and int(percent) != int((block_num - 1) * block_size * 100 / total_size):
-            logging.info(f"Téléchargement du modèle: {percent:.0f}%")
-    
     try:
         start_time = time.time()
-        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH, reporthook=download_progress)
+        
+        # Essayer chaque URL
+        success = False
+        for url in urls:
+            print(f"\n🔗 Essai avec : {url}")
+            if download_with_retry(url, MODEL_PATH):
+                success = True
+                break
+        
+        if not success:
+            raise Exception("Échec du téléchargement après toutes les tentatives")
+        
         print("\n✅ Téléchargement terminé!")
         
         download_time = time.time() - start_time
-        print(f"Temps de téléchargement: {download_time/60:.1f} minutes")
+        print(f"⏱️ Temps de téléchargement: {download_time/60:.1f} minutes")
         
         file_size = os.path.getsize(MODEL_PATH)
-        print(f"Taille du fichier: {file_size / (1024**3):.1f} GB")
+        print(f"📦 Taille du fichier: {file_size / (1024**3):.1f} GB")
         
         if file_size < 30_000_000_000:
             raise Exception(f"Fichier trop petit: {file_size} bytes")
@@ -386,8 +504,21 @@ def download_model_if_needed():
         print(f"\n❌ Erreur lors du téléchargement: {e}")
         download_in_progress = False
         model_download_progress.set(0)
-        if os.path.exists(MODEL_PATH):
-            os.remove(MODEL_PATH)
+        
+        # Instructions pour téléchargement manuel
+        print("\n" + "="*60)
+        print("📋 TÉLÉCHARGEMENT MANUEL REQUIS")
+        print("="*60)
+        print("\nPour contourner la limite de HuggingFace :")
+        print(f"\n1. Téléchargez le modèle avec votre navigateur :")
+        print(f"   {MODEL_URL}")
+        print(f"\n2. Ou utilisez wget avec reprise :")
+        print(f"   wget -c '{MODEL_URL}' -O {MODEL_PATH}")
+        print(f"\n3. Ou utilisez huggingface-cli :")
+        print(f"   pip install huggingface-hub")
+        print(f"   huggingface-cli download TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf --local-dir /workspace/models/")
+        print("\n" + "="*60)
+        
         raise
     finally:
         download_in_progress = False
