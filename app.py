@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 API FastAPI pour servir le modèle Mixtral-8x7B GGUF avec llama-cpp-python
-Optimisé pour conversations médicales françaises avec extraction JSON AMÉLIORÉE
-Version avec parsing JSON intelligent et nettoyage automatique
+Optimisé pour conversations médicales françaises avec streaming
+Version 5.0.0 avec streaming complet
 """
 import os
 import time
@@ -45,7 +45,7 @@ system_info.info({
     'model': 'mixtral-8x7b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '4.0.0'  # Version avec JSON amélioré
+    'version': '5.0.0'  # Version avec streaming
 })
 
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
@@ -74,6 +74,56 @@ json_parse_failure_total = Counter('json_parse_failure_total', 'Number of failed
 inference_queue = asyncio.Queue(maxsize=1000)
 download_in_progress = False
 download_complete = False
+
+# ===== MODÈLES PYDANTIC =====
+class Message(BaseModel):
+    role: str
+    content: str
+
+class ChatCompletionRequest(BaseModel):
+    model: str = "mixtral-8x7b"
+    messages: List[Message]
+    temperature: Optional[float] = 0.1
+    max_tokens: Optional[int] = 4096
+    top_p: Optional[float] = 0.9
+    stream: Optional[bool] = False
+    stop: Optional[List[str]] = None
+    response_format: Optional[Dict[str, str]] = None
+    json_schema: Optional[Dict[str, Any]] = None
+
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class Choice(BaseModel):
+    index: int
+    message: Message
+    finish_reason: str
+
+class ChatCompletionResponse(BaseModel):
+    id: str
+    object: str = "chat.completion"
+    created: int
+    model: str
+    choices: List[Choice]
+    usage: Usage
+
+# Variable globale pour le modèle
+llm = None
+
+# ===== AUTHENTIFICATION =====
+security = HTTPBearer()
+
+def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    """Vérifier le token Bearer"""
+    if credentials.credentials != API_TOKEN:
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid authentication token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return credentials.credentials
 
 # ===== FONCTIONS DE MÉTRIQUES =====
 def update_gpu_metrics():
@@ -136,11 +186,8 @@ Pose une seule question à la fois et sois concis (2-3 phrases maximum)."""
 
 def clean_escaped_json(text: str) -> str:
     """Nettoie les caractères d'échappement dans le JSON"""
-    # Remplace les underscores échappés
     text = text.replace(r'\_', '_')
-    # Remplace les doubles backslashes
     text = text.replace('\\\\', '\\')
-    # Nettoie les espaces et retours à la ligne excessifs
     text = re.sub(r'\n\s*\n', '\n', text)
     return text
 
@@ -150,32 +197,25 @@ def extract_json_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
     Version améliorée qui gère plusieurs formats
     """
     text = text.strip()
-    
-    # Nettoie d'abord les échappements
     text = clean_escaped_json(text)
     
-    # Cas 1: Le texte commence et finit par des accolades
     if text.startswith('{') and text.endswith('}'):
         return text, None
     
-    # Cas 2: JSON dans des balises code
     json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
     if json_match:
         json_str = json_match.group(1).strip()
         remaining = text[:json_match.start()] + text[json_match.end():]
         return json_str, remaining.strip() if remaining.strip() else None
     
-    # Cas 3: JSON avec un préfixe (JSON:, json:, etc.)
     json_prefix_match = re.search(r'(?:JSON|json|Json):\s*({.*?})', text, re.DOTALL)
     if json_prefix_match:
         json_str = json_prefix_match.group(1)
         remaining = text[:json_prefix_match.start()] + text[json_prefix_match.end():]
         return json_str, remaining.strip() if remaining.strip() else None
     
-    # Cas 4: Cherche la première accolade ouvrante et la dernière fermante
     start = text.find('{')
     if start != -1:
-        # Compte les accolades pour trouver la fin correcte
         count = 0
         end = -1
         for i in range(start, len(text)):
@@ -192,7 +232,6 @@ def extract_json_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
             remaining = text[:start] + text[end+1:]
             return json_str, remaining.strip() if remaining.strip() else None
     
-    # Cas 5: Pas de JSON trouvé
     return None, text
 
 def smart_json_parse(text: str) -> Dict[str, Any]:
@@ -201,7 +240,6 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
     """
     original_text = text
     
-    # Étape 1: Extraction du JSON
     json_str, remaining_text = extract_json_from_text(text)
     
     if not json_str:
@@ -212,12 +250,10 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
             "original_response": original_text
         }
     
-    # Étape 2: Tentative de parsing direct
     try:
         result = json.loads(json_str)
         json_parse_success_total.inc()
         
-        # Si il y a du texte supplémentaire, on peut l'ajouter comme metadata
         if remaining_text:
             result["_metadata"] = {
                 "additional_text": remaining_text,
@@ -228,10 +264,7 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         logging.warning(f"Première tentative de parsing échouée: {e}")
     
-    # Étape 3: Nettoyage et nouvelle tentative
-    # Retire les commentaires style //
     json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
-    # Retire les virgules trailing
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
     
@@ -250,10 +283,7 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
     except json.JSONDecodeError as e:
         logging.warning(f"Deuxième tentative échouée: {e}")
     
-    # Étape 4: Tentative de réparation avec regex
-    # Essaie de corriger les clés sans guillemets
     json_str = re.sub(r'(\w+):', r'"\1":', json_str)
-    # Corrige les valeurs true/false/null
     json_str = re.sub(r'\btrue\b', 'true', json_str, flags=re.IGNORECASE)
     json_str = re.sub(r'\bfalse\b', 'false', json_str, flags=re.IGNORECASE)
     json_str = re.sub(r'\bnull\b', 'null', json_str, flags=re.IGNORECASE)
@@ -274,7 +304,6 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
         logging.error(f"Toutes les tentatives de parsing ont échoué: {e}")
         json_parse_failure_total.inc()
         
-        # Retourne une structure d'erreur
         return {
             "error": "JSON parsing failed after all attempts",
             "original_response": original_text,
@@ -289,7 +318,6 @@ def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> st
     if request_format and request_format.get("type") == "json_object":
         parsed = smart_json_parse(text)
         
-        # Nettoie les metadata si elles existent
         if "_metadata" in parsed and not os.getenv("DEBUG_MODE"):
             del parsed["_metadata"]
         
@@ -297,62 +325,11 @@ def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> st
     
     return text
 
-# ===== MODÈLES PYDANTIC =====
-class Message(BaseModel):
-    role: str
-    content: str
-
-class ChatCompletionRequest(BaseModel):
-    model: str = "mixtral-8x7b"
-    messages: List[Message]
-    temperature: Optional[float] = 0.1
-    max_tokens: Optional[int] = 4096
-    top_p: Optional[float] = 0.9
-    stream: Optional[bool] = False
-    stop: Optional[List[str]] = None
-    response_format: Optional[Dict[str, str]] = None
-    json_schema: Optional[Dict[str, Any]] = None  # Pour forcer un schéma spécifique
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-class Choice(BaseModel):
-    index: int
-    message: Message
-    finish_reason: str
-
-class ChatCompletionResponse(BaseModel):
-    id: str
-    object: str = "chat.completion"
-    created: int
-    model: str
-    choices: List[Choice]
-    usage: Usage
-
-# Variable globale pour le modèle
-llm = None
-
-# ===== AUTHENTIFICATION =====
-security = HTTPBearer()
-
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Vérifier le token Bearer"""
-    if credentials.credentials != API_TOKEN:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    return credentials.credentials
-
 # ===== GESTION DU MODÈLE =====
 def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 5):
     """Télécharge avec retry et gestion des erreurs 429"""
     import urllib.error
     
-    # Récupérer le token depuis les variables d'environnement
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     
     if not hf_token:
@@ -360,15 +337,12 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
         print("   Définissez la variable HF_TOKEN pour éviter les erreurs 429")
         print("   export HF_TOKEN='votre_token_ici'")
     
-    # Essayer huggingface-cli en premier si token disponible
     if hf_token and subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0:
         print("🔑 Token HuggingFace détecté, utilisation de huggingface-cli...")
         try:
-            # D'abord, configurer le token
             subprocess.run(["huggingface-cli", "login", "--token", hf_token], 
                          capture_output=True, check=True)
             
-            # Puis télécharger
             hf_cmd = [
                 "huggingface-cli", "download",
                 "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF",
@@ -387,7 +361,6 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
         except Exception as e:
             print(f"⚠️ Erreur avec huggingface-cli: {e}")
     
-    # Fallback sur les méthodes classiques
     for attempt in range(max_retries):
         try:
             if attempt > 0:
@@ -397,7 +370,6 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
             
             print(f"\n📥 Tentative {attempt + 1}/{max_retries}")
             
-            # Headers avec token si disponible
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
@@ -433,7 +405,6 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
                     continue
                 raise
     
-    # Dernière tentative avec wget
     print("\n🔧 Tentative finale avec wget...")
     try:
         wget_cmd = ["wget", "-c", "-O", dest, url]
@@ -460,7 +431,6 @@ def download_model_if_needed():
             return
         else:
             print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")
-            # Ne pas supprimer, wget peut reprendre
     
     if download_in_progress:
         print("⏳ Téléchargement déjà en cours...")
@@ -468,17 +438,10 @@ def download_model_if_needed():
     
     download_in_progress = True
     
-    # URLs alternatives avec différentes méthodes
     urls = [
         MODEL_URL,
-        # Tentative avec paramètre download
         "https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf?download=true",
-        # Via CDN alternatif (si disponible)
-        "https://cdn-lfs.huggingface.co/repos/47/23/4723e5fff847c49ee1a4b5056cf1aec01e866c8f7e09c0d8bb8e9b4ad27e2659/4aa8069d24261fd1da11dd0e5f5b0b7f5fe7bd20397cd72e8d4686cbcb6ee72d?response-content-disposition=attachment%3B+filename*%3DUTF-8%27%27mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf%3B+filename%3D%22mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf%22%3B&response-content-type=application%2Foctet-stream&Expires=1720612362&Policy=eyJTdGF0ZW1lbnQiOlt7IkNvbmRpdGlvbiI6eyJEYXRlTGVzc1RoYW4iOnsiQVdTOkVwb2NoVGltZSI6MTcyMDYxMjM2Mn19LCJSZXNvdXJjZSI6Imh0dHBzOi8vY2RuLWxmcy5odWdnaW5nZmFjZS5jby9yZXBvcy80Ny8yMy80NzIzZTVmZmY4NDdjNDllZTFhNGI1MDU2Y2YxYWVjMDFlODY2YzhmN2UwOWMwZDhiYjhlOWI0YWQyN2UyNjU5LzRhYTgwNjlkMjQyNjFmZDFkYTExZGQwZTVmNWIwYjdmNWZlN2JkMjAzOTdjZDcyZThkNDY4NmNiY2I2ZWU3MmQ%7EcmVzcG9uc2UtY29udGVudC1kaXNwb3NpdGlvbj0qJnJlc3BvbnNlLWNvbnRlbnQtdHlwZT0qIn1dfQ__&Signature=aBqZVyARPNPTWRD8ZH9sM0oAl6fTXFNWYVTcf87jmvqXgwBQCqGOgPQ3oVwZa0OKuLgqKVQZGCV7KCJH8pdcCa2hBhwkMJdqGBOiNqtFc-y6aOEk6bhZUE-KvYjMBnQZJo8T8HBNsAqSacBnxNFg3SLPJoqOx6Fwf6R8JgAepbRMhGRWEQs9l7ItnKlBKSxvASMRaM8LhVgeLCMvTTdCN93ruBu4eMBV2TvaZVocDAXFH2iKvYpG7kkUenIs8KiVxAMtBb0pFfaM8hNxGpu4xVz40fQY1lDijkiESYqcCq9sNQgvJYACtj9k-lQgH0VxaL0rT4dve9MhnqKf3AiWMA__&Key-Pair-Id=KVTP0A1DKRTAX",
     ]
-    
-    # Essayer aussi avec huggingface-cli si disponible
-    hf_cli_available = subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0
     
     print(f"\n{'='*60}")
     print(f"📥 TÉLÉCHARGEMENT DU MODÈLE MIXTRAL-8X7B")
@@ -493,7 +456,6 @@ def download_model_if_needed():
     try:
         start_time = time.time()
         
-        # Essayer chaque URL
         success = False
         for url in urls:
             print(f"\n🔗 Essai avec : {url}")
@@ -523,7 +485,6 @@ def download_model_if_needed():
         download_in_progress = False
         model_download_progress.set(0)
         
-        # Instructions pour téléchargement manuel
         print("\n" + "="*60)
         print("📋 TÉLÉCHARGEMENT MANUEL REQUIS")
         print("="*60)
@@ -590,15 +551,12 @@ def format_messages_mistral(messages: List[Message]) -> str:
     prompt_parts = ["<s>"]
     has_system_prompt = False
     
-    # Ajoute automatiquement une instruction pour le JSON si nécessaire
     json_instruction = """You are a helpful assistant that ALWAYS responds with valid JSON.
 Your response must be ONLY the JSON object, with no additional text before or after.
 Do not include any explanations, comments, or markdown formatting.
 Just return the raw JSON object."""
     
-    # Gérer le system prompt
     if messages and messages[0].role == "system":
-        # Combine le system prompt existant avec l'instruction JSON
         system_content = messages[0].content
         if "json" in system_content.lower() or "JSON" in system_content:
             prompt_parts.append(f"{system_content}\n\n")
@@ -607,7 +565,6 @@ Just return the raw JSON object."""
         messages = messages[1:]
         has_system_prompt = True
     else:
-        # Ajoute l'instruction JSON comme system prompt
         prompt_parts.append(f"{json_instruction}\n\n")
         has_system_prompt = True
 
@@ -654,8 +611,8 @@ async def lifespan(app: FastAPI):
 # ===== APPLICATION FASTAPI =====
 app = FastAPI(
     title="Mixtral-8x7B GGUF API",
-    version="4.0.0",
-    description="API FastAPI pour Mixtral-8x7B avec parsing JSON intelligent",
+    version="5.0.0",
+    description="API FastAPI pour Mixtral-8x7B avec streaming",
     lifespan=lifespan
 )
 
@@ -678,21 +635,22 @@ async def metrics():
 @app.get("/")
 async def root():
     return {
-        "message": "Mixtral-8x7B GGUF API with Smart JSON Parsing",
+        "message": "Mixtral-8x7B GGUF API with Streaming",
         "status": "running" if llm is not None else "loading",
         "model": "Mixtral-8x7B-Instruct-v0.1.Q5_K_M.gguf",
         "model_loaded": llm is not None,
         "download_complete": download_complete,
         "download_in_progress": download_in_progress,
         "features": [
+            "Streaming responses",
             "Intelligent JSON parsing",
-            "Automatic escape character cleanup",
-            "Multiple JSON extraction strategies",
-            "Structured error responses"
+            "Natural conversation mode",
+            "Summary extraction endpoint"
         ],
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
-            "/ws": "WebSocket - Chat endpoint (requires token in query)",
+            "/ws": "WebSocket - Streaming chat endpoint (requires token in query)",
+            "/v1/summary": "POST - Extract structured summary from conversation",
             "/v1/models": "GET - List available models",
             "/health": "GET - Health check",
             "/metrics": "GET - Prometheus metrics",
@@ -767,7 +725,6 @@ async def create_summary(request: dict):
     try:
         messages = request.get("messages", [])
         
-        # Prompt pour extraction finale
         extraction_prompt = f"""Analyse cette conversation médicale et extrais UNIQUEMENT les informations explicitement fournies.
 Retourne un JSON avec ces champs (null si non fourni) :
 
@@ -787,7 +744,6 @@ Conversation à analyser:
 
 Retourne UNIQUEMENT le JSON, sans texte avant ou après."""
 
-        # Génération synchrone pour l'extraction
         response = llm(
             extraction_prompt,
             max_tokens=500,
@@ -797,8 +753,6 @@ Retourne UNIQUEMENT le JSON, sans texte avant ou après."""
         )
         
         result_text = response['choices'][0]['text'].strip()
-        
-        # Parser avec la fonction intelligente existante
         parsed_result = smart_json_parse(result_text)
         
         return {
@@ -826,10 +780,8 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         await inference_queue.put(request)
         
-        # Formatte le prompt avec support JSON amélioré
         prompt = format_messages_mistral(request.messages)
         
-        # Si un schéma JSON est fourni, l'ajoute au prompt
         if request.json_schema:
             schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(request.json_schema, indent=2)}"
             prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
@@ -863,14 +815,11 @@ async def chat_completions(request: ChatCompletionRequest):
             fastapi_inference_tokens_per_second.set(tps)
             logging.info(f"[PERF] Génération: {tps:.1f} tokens/sec, {inference_duration:.2f}s total")
         
-        # Utilise le parsing JSON intelligent
         generated_text = response['choices'][0]['text'].strip()
         
-        # Si on attend du JSON, applique le parsing intelligent
         if request.response_format and request.response_format.get("type") == "json_object":
             generated_text = ensure_json_response(generated_text, request.response_format)
             
-            # Vérifie si le parsing a réussi
             try:
                 parsed = json.loads(generated_text)
                 if "error" in parsed and "original_response" in parsed:
@@ -940,27 +889,23 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 continue
             
             try:
-                # Format du prompt pour conversation naturelle
                 messages = [Message(**msg) for msg in data.get("messages", [])]
                 prompt = format_messages_mistral_conversational(messages)
                 
-                # Début du streaming
                 await websocket.send_json({
                     "type": "stream_start",
                     "request_id": data.get("request_id")
                 })
                 
-                # Génération avec streaming
                 stream = llm(
                     prompt,
                     max_tokens=data.get("max_tokens", 200),
                     temperature=data.get("temperature", 0.7),
                     top_p=data.get("top_p", 0.9),
                     stop=["</s>", "[INST]", "[/INST]"],
-                    stream=True  # Activation du streaming
+                    stream=True
                 )
                 
-                # Buffer pour accumuler les tokens
                 full_response = ""
                 tokens_count = 0
                 
@@ -969,14 +914,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     full_response += token
                     tokens_count += 1
                     
-                    # Envoyer chaque token
                     await websocket.send_json({
                         "type": "stream_token",
                         "token": token,
                         "request_id": data.get("request_id")
                     })
                 
-                # Fin du streaming
                 await websocket.send_json({
                     "type": "stream_end",
                     "full_response": full_response,
