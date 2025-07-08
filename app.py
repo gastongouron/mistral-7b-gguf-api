@@ -115,6 +115,24 @@ async def metrics_update_task():
         await asyncio.sleep(5)
 
 # ===== PARSING JSON AMÉLIORÉ =====
+def format_messages_mistral_conversational(messages: List[Message]) -> str:
+    """Formater les messages pour une conversation naturelle sans JSON"""
+    prompt_parts = ["<s>"]
+    
+    # System prompt pour conversation naturelle
+    system_prompt = """Tu es un assistant médical français qui collecte des informations pour une prise de rendez-vous.
+Sois naturel, empathique et conversationnel. Ne génère JAMAIS de JSON, réponds uniquement en langage naturel.
+Pose une seule question à la fois et sois concis (2-3 phrases maximum)."""
+    
+    prompt_parts.append(f"[INST] {system_prompt} [/INST]")
+    
+    for message in messages:
+        if message.role == "user":
+            prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
+        elif message.role == "assistant":
+            prompt_parts.append(f" {message.content}</s>")
+    
+    return "".join(prompt_parts)
 
 def clean_escaped_json(text: str) -> str:
     """Nettoie les caractères d'échappement dans le JSON"""
@@ -740,6 +758,59 @@ async def list_models():
     finally:
         fastapi_request_duration_seconds.labels(method="GET", endpoint="/v1/models").observe(time.time() - start_time)
 
+@app.post("/v1/summary", dependencies=[Depends(verify_token)])
+async def create_summary(request: dict):
+    """Endpoint pour créer un résumé structuré de la conversation"""
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    try:
+        messages = request.get("messages", [])
+        
+        # Prompt pour extraction finale
+        extraction_prompt = f"""Analyse cette conversation médicale et extrais UNIQUEMENT les informations explicitement fournies.
+Retourne un JSON avec ces champs (null si non fourni) :
+
+{{
+  "nom": "valeur ou null",
+  "prenom": "valeur ou null", 
+  "dateNaissance": "format JJ/MM/AAAA ou null",
+  "dejaPatient": "oui/non/null",
+  "praticien": "Dr Nom ou null",
+  "motif": "description ou null",
+  "resume": "résumé court de la demande",
+  "categorie": "appointment_create/emergency/etc"
+}}
+
+Conversation à analyser:
+{chr(10).join([f"{m['role']}: {m['content']}" for m in messages])}
+
+Retourne UNIQUEMENT le JSON, sans texte avant ou après."""
+
+        # Génération synchrone pour l'extraction
+        response = llm(
+            extraction_prompt,
+            max_tokens=500,
+            temperature=0.1,
+            top_p=0.9,
+            stop=["</s>", "[INST]", "[/INST]"]
+        )
+        
+        result_text = response['choices'][0]['text'].strip()
+        
+        # Parser avec la fonction intelligente existante
+        parsed_result = smart_json_parse(result_text)
+        
+        return {
+            "status": "success",
+            "extraction": parsed_result,
+            "usage": response['usage']
+        }
+        
+    except Exception as e:
+        logging.error(f"Erreur création résumé: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_token)])
 async def chat_completions(request: ChatCompletionRequest):
     """Endpoint compatible OpenAI avec parsing JSON intelligent"""
@@ -840,7 +911,7 @@ async def chat_completions(request: ChatCompletionRequest):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """Endpoint WebSocket avec parsing JSON intelligent"""
+    """Endpoint WebSocket avec streaming pour fluidité conversationnelle"""
     if token != API_TOKEN:
         await websocket.close(code=1008, reason="Invalid token")
         return
@@ -855,9 +926,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
         "model_loaded": llm is not None,
         "capabilities": [
             "French medical conversations",
-            "Structured JSON output",
-            "32K context",
-            "Intelligent JSON parsing"
+            "Streaming responses",
+            "32K context"
         ]
     }
     await websocket.send_json(welcome_msg)
@@ -867,79 +937,62 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             data = await websocket.receive_json()
             if llm is None:
                 await websocket.send_json({"type": "error", "error": "Model not loaded"})
-                fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="error").inc()
                 continue
             
             try:
-                request = ChatCompletionRequest(
-                    messages=[Message(**msg) for msg in data.get("messages", [])],
-                    **{k: v for k, v in data.items() if k != "messages"}
-                )
-                await inference_queue.put(request)
+                # Format du prompt pour conversation naturelle
+                messages = [Message(**msg) for msg in data.get("messages", [])]
+                prompt = format_messages_mistral_conversational(messages)
                 
-                prompt = format_messages_mistral(request.messages)
+                # Début du streaming
+                await websocket.send_json({
+                    "type": "stream_start",
+                    "request_id": data.get("request_id")
+                })
                 
-                # Ajoute le schéma JSON si fourni
-                if data.get("json_schema"):
-                    schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(data['json_schema'], indent=2)}"
-                    prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
-                
-                start_time = time.time()
-                response = llm(
+                # Génération avec streaming
+                stream = llm(
                     prompt,
-                    max_tokens=data.get("max_tokens", 4096),
-                    temperature=data.get("temperature", 0.1),
+                    max_tokens=data.get("max_tokens", 200),
+                    temperature=data.get("temperature", 0.7),
                     top_p=data.get("top_p", 0.9),
-                    top_k=data.get("top_k", 40),
-                    stop=data.get("stop", ["</s>", "[INST]", "[/INST]"]),
-                    echo=False,
-                    repeat_penalty=1.1
+                    stop=["</s>", "[INST]", "[/INST]"],
+                    stream=True  # Activation du streaming
                 )
-                await inference_queue.get()
-                elapsed = (time.time() - start_time) * 1000
-                inference_duration = elapsed / 1000.0
-
-                fastapi_inference_duration_seconds.labels(model="mixtral-8x7b").observe(inference_duration)
-                fastapi_inference_tokens_total.labels(type="prompt").inc(response['usage']['prompt_tokens'])
-                fastapi_inference_tokens_total.labels(type="completion").inc(response['usage']['completion_tokens'])
-
-                if inference_duration > 0:
-                    tps = response['usage']['completion_tokens'] / inference_duration
-                    fastapi_inference_tokens_per_second.set(tps)
-
-                generated_text = response['choices'][0]['text'].strip()
                 
-                # Applique le parsing JSON intelligent si nécessaire
-                if data.get("response_format") and data["response_format"].get("type") == "json_object":
-                    generated_text = ensure_json_response(generated_text, data.get("response_format"))
-
-                response_json = {
-                    "type": "completion",
-                    "choices": [{
-                        "message": {
-                            "role": "assistant",
-                            "content": generated_text
-                        },
-                        "finish_reason": response['choices'][0]['finish_reason']
-                    }],
-                    "usage": response['usage'],
-                    "time_ms": round(elapsed),
-                    "tokens_per_second": round(response['usage']['completion_tokens'] / (elapsed / 1000), 2)
-                }
+                # Buffer pour accumuler les tokens
+                full_response = ""
+                tokens_count = 0
                 
-                if "request_id" in data:
-                    response_json["request_id"] = data["request_id"]
+                for output in stream:
+                    token = output['choices'][0]['text']
+                    full_response += token
+                    tokens_count += 1
+                    
+                    # Envoyer chaque token
+                    await websocket.send_json({
+                        "type": "stream_token",
+                        "token": token,
+                        "request_id": data.get("request_id")
+                    })
                 
-                await websocket.send_json(response_json)
+                # Fin du streaming
+                await websocket.send_json({
+                    "type": "stream_end",
+                    "full_response": full_response,
+                    "tokens": tokens_count,
+                    "request_id": data.get("request_id")
+                })
+                
                 fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
                 
             except Exception as e:
                 logging.error(f"[WS] Erreur: {str(e)}", exc_info=True)
-                fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="error").inc()
-                error_response = {"type": "error", "error": str(e)}
-                if "request_id" in data:
-                    error_response["request_id"] = data["request_id"]
-                await websocket.send_json(error_response)
+                await websocket.send_json({
+                    "type": "error",
+                    "error": str(e),
+                    "request_id": data.get("request_id")
+                })
     
     except WebSocketDisconnect:
         logging.info("[WS] Client déconnecté")
