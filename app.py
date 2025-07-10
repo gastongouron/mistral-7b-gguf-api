@@ -664,6 +664,7 @@ async def root():
         }
     }
 
+
 @app.get("/health")
 async def health_check():
     health_status = {
@@ -886,6 +887,36 @@ async def chat_completions(request: ChatCompletionRequest):
     finally:
         fastapi_requests_total.labels(method="POST", endpoint="/v1/chat/completions", status=status).inc()
         fastapi_request_duration_seconds.labels(method="POST", endpoint="/v1/chat/completions").observe(time.time() - start_time)
+
+@app.post("/v1/warmup", dependencies=[Depends(verify_token)])
+async def warmup():
+    """Endpoint pour préchauffer le modèle"""
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    try:
+        # Faire une petite inférence pour warmup
+        warmup_prompt = "<s>[INST] Bonjour [/INST]"
+        
+        start_time = time.time()
+        response = llm(
+            warmup_prompt,
+            max_tokens=10,
+            temperature=0.1,
+            echo=False
+        )
+        duration = time.time() - start_time
+        
+        return {
+            "status": "success",
+            "warmup_time": f"{duration:.2f}s",
+            "model_ready": True,
+            "response": response['choices'][0]['text'].strip()
+        }
+        
+    except Exception as e:
+        logging.error(f"Erreur warmup: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/v1/debug/prompt", dependencies=[Depends(verify_token)])
 async def debug_prompt(request: ChatCompletionRequest):
