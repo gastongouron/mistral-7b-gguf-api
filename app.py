@@ -167,20 +167,27 @@ async def metrics_update_task():
 # ===== PARSING JSON AMÉLIORÉ =====
 def format_messages_mistral_conversational(messages: List[Message]) -> str:
     """Formater les messages pour une conversation naturelle sans JSON"""
-    prompt_parts = ["<s>"]
+    prompt_parts = []
     
-    # System prompt pour conversation naturelle
-    system_prompt = """Tu es un assistant médical français qui collecte des informations pour une prise de rendez-vous.
-Sois naturel, empathique et conversationnel. Ne génère JAMAIS de JSON, réponds uniquement en langage naturel.
-Pose une seule question à la fois et sois concis (2-3 phrases maximum)."""
-    
-    prompt_parts.append(f"[INST] {system_prompt} [/INST]")
-    
-    for message in messages:
-        if message.role == "user":
-            prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
+    for i, message in enumerate(messages):
+        if message.role == "system":
+            # Premier message système sans <s> au début
+            if i == 0:
+                prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
+            else:
+                prompt_parts.append(f"[INST] {message.content} [/INST]")
+        elif message.role == "user":
+            # Ajouter <s> seulement si ce n'est pas le premier message
+            if i > 0:
+                prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
+            else:
+                prompt_parts.append(f"[INST] {message.content} [/INST]")
         elif message.role == "assistant":
             prompt_parts.append(f" {message.content}</s>")
+    
+    # S'assurer qu'on commence bien par <s>
+    if prompt_parts and not prompt_parts[0].startswith("<s>"):
+        prompt_parts[0] = "<s>" + prompt_parts[0]
     
     return "".join(prompt_parts)
 
@@ -550,36 +557,35 @@ def format_messages_mistral(messages: List[Message]) -> str:
     """Formater les messages pour Mistral avec support JSON amélioré"""
     prompt_parts = ["<s>"]
     has_system_prompt = False
+    system_mentions_json = False
     
-    json_instruction = """You are a helpful assistant that ALWAYS responds with valid JSON.
-Your response must be ONLY the JSON object, with no additional text before or after.
-Do not include any explanations, comments, or markdown formatting.
-Just return the raw JSON object."""
-    
-    if messages and messages[0].role == "system":
-        system_content = messages[0].content
-        if "json" in system_content.lower() or "JSON" in system_content:
-            prompt_parts.append(f"{system_content}\n\n")
-        else:
-            prompt_parts.append(f"{system_content}\n\n{json_instruction}\n\n")
-        messages = messages[1:]
-        has_system_prompt = True
-    else:
-        prompt_parts.append(f"{json_instruction}\n\n")
-        has_system_prompt = True
-
+    # Parcourir tous les messages pour construire le prompt
     for i, message in enumerate(messages):
-        if message.role == "user":
+        if message.role == "system":
+            # Utiliser le prompt système fourni par VoxEngine
+            system_content = message.content
+            prompt_parts.append(f"[INST] {system_content} [/INST]")
+            has_system_prompt = True
+            # Vérifier si le système mentionne JSON
+            if "json" in system_content.lower() or "JSON" in system_content:
+                system_mentions_json = True
+                
+        elif message.role == "user":
             if i == 0 and not has_system_prompt:
+                # Premier message utilisateur sans prompt système
                 prompt_parts.append(f"[INST] {message.content} [/INST]")
             else:
+                # Messages utilisateur suivants
                 prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
+                
         elif message.role == "assistant":
+            # Réponses de l'assistant
             prompt_parts.append(f" {message.content}</s>")
-            
-    if not prompt_parts[-1].strip().endswith("</s>"):
+    
+    # S'assurer que le prompt se termine correctement
+    if not prompt_parts[-1].strip().endswith("</s>") and not prompt_parts[-1].strip().endswith("[/INST]"):
         prompt_parts.append(" ")
-
+    
     return "".join(prompt_parts)
 
 # ===== LIFESPAN =====
@@ -780,11 +786,33 @@ async def chat_completions(request: ChatCompletionRequest):
     try:
         await inference_queue.put(request)
         
-        prompt = format_messages_mistral(request.messages)
+        # Log pour debug
+        logging.info(f"[CHAT] Messages reçus: {[(m.role, m.content[:50] + '...' if len(m.content) > 50 else m.content) for m in request.messages]}")
         
+        # Déterminer le format à utiliser
+        # Si le premier message est un prompt système qui mentionne JSON ou si response_format demande JSON
+        needs_json_format = False
+        if request.response_format and request.response_format.get("type") == "json_object":
+            needs_json_format = True
+        elif request.messages and request.messages[0].role == "system":
+            system_content = request.messages[0].content.lower()
+            if "json" in system_content or "extraction" in system_content:
+                needs_json_format = True
+        
+        # Utiliser le bon formatteur
+        if needs_json_format:
+            prompt = format_messages_mistral(request.messages)
+        else:
+            # Pour les conversations naturelles
+            prompt = format_messages_mistral_conversational(request.messages)
+        
+        # Ajouter le schema JSON si fourni
         if request.json_schema:
             schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(request.json_schema, indent=2)}"
             prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
+        
+        logging.info(f"[CHAT] Format utilisé: {'JSON' if needs_json_format else 'Conversational'}")
+        logging.debug(f"[CHAT] Prompt final (200 premiers chars): {prompt[:200]}...")
         
         inference_start = time.time()
         
@@ -817,6 +845,7 @@ async def chat_completions(request: ChatCompletionRequest):
         
         generated_text = response['choices'][0]['text'].strip()
         
+        # Si on attend du JSON et que response_format le demande
         if request.response_format and request.response_format.get("type") == "json_object":
             generated_text = ensure_json_response(generated_text, request.response_format)
             
@@ -858,6 +887,43 @@ async def chat_completions(request: ChatCompletionRequest):
         fastapi_requests_total.labels(method="POST", endpoint="/v1/chat/completions", status=status).inc()
         fastapi_request_duration_seconds.labels(method="POST", endpoint="/v1/chat/completions").observe(time.time() - start_time)
 
+@app.post("/v1/debug/prompt", dependencies=[Depends(verify_token)])
+async def debug_prompt(request: ChatCompletionRequest):
+    """Endpoint de debug pour voir le prompt généré sans appeler le modèle"""
+    try:
+        # Déterminer le format
+        needs_json_format = False
+        if request.response_format and request.response_format.get("type") == "json_object":
+            needs_json_format = True
+        elif request.messages and request.messages[0].role == "system":
+            system_content = request.messages[0].content.lower()
+            if "json" in system_content or "extraction" in system_content:
+                needs_json_format = True
+        
+        # Générer les deux formats
+        prompt_conversational = format_messages_mistral_conversational(request.messages)
+        prompt_json = format_messages_mistral(request.messages)
+        
+        return {
+            "messages_received": [
+                {
+                    "role": m.role,
+                    "content": m.content[:100] + "..." if len(m.content) > 100 else m.content
+                } for m in request.messages
+            ],
+            "detected_format": "json" if needs_json_format else "conversational",
+            "prompt_conversational": prompt_conversational[:500] + "..." if len(prompt_conversational) > 500 else prompt_conversational,
+            "prompt_json": prompt_json[:500] + "..." if len(prompt_json) > 500 else prompt_json,
+            "prompt_used": (prompt_json if needs_json_format else prompt_conversational)[:500] + "...",
+            "model_config": {
+                "temperature": request.temperature or 0.1,
+                "max_tokens": request.max_tokens or 4096,
+                "top_p": request.top_p or 0.9
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     """Endpoint WebSocket avec streaming pour fluidité conversationnelle"""
@@ -890,7 +956,20 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             
             try:
                 messages = [Message(**msg) for msg in data.get("messages", [])]
-                prompt = format_messages_mistral_conversational(messages)
+                
+                # Log pour debug
+                logging.info(f"[WS] Messages reçus: {[(m.role, len(m.content)) for m in messages]}")
+                
+                # Utiliser le formatteur conversationnel par défaut pour WebSocket
+                # Sauf si explicitement demandé autrement
+                use_json_format = data.get("format") == "json"
+                
+                if use_json_format:
+                    prompt = format_messages_mistral(messages)
+                else:
+                    prompt = format_messages_mistral_conversational(messages)
+                
+                logging.info(f"[WS] Format utilisé: {'JSON' if use_json_format else 'Conversational'}")
                 
                 await websocket.send_json({
                     "type": "stream_start",
