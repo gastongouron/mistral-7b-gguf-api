@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 API FastAPI pour servir le modèle Mixtral-8x7B GGUF avec llama-cpp-python
-Version 6.0.0 - Production Ready avec Streaming Optimisé
+Optimisé pour conversations médicales françaises avec streaming
+Version 5.0.0 avec streaming complet
 """
 import os
 import time
@@ -35,8 +36,7 @@ API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 # Configuration du logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%H:%M:%S'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
 # ===== MÉTRIQUES PROMETHEUS =====
@@ -45,7 +45,7 @@ system_info.info({
     'model': 'mixtral-8x7b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '6.0.0'  # Version avec streaming optimisé
+    'version': '5.0.0'  # Version avec streaming
 })
 
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
@@ -65,7 +65,6 @@ fastapi_inference_duration_seconds = Histogram('fastapi_inference_duration_secon
 fastapi_inference_queue_size = Gauge('fastapi_inference_queue_size', 'Current inference queue size')
 fastapi_inference_tokens_total = Counter('fastapi_inference_tokens_total', 'Total tokens processed', ['type'])
 fastapi_inference_tokens_per_second = Gauge('fastapi_inference_tokens_per_second', 'Tokens generated per second')
-fastapi_streaming_latency_seconds = Histogram('fastapi_streaming_latency_seconds', 'Latency between token generation and sending')
 model_loaded = Gauge('model_loaded', 'Whether the model is loaded (1) or not (0)')
 model_loading_duration_seconds = Gauge('model_loading_duration_seconds', 'Time taken to load the model')
 model_download_progress = Gauge('model_download_progress', 'Model download progress in percentage')
@@ -544,7 +543,7 @@ def load_model():
         n_ctx=32768,
         n_threads=12,
         n_gpu_layers=n_gpu_layers,
-        n_batch=512,  # Gardé à 512 pour performance optimale
+        n_batch=512,
         use_mmap=True,
         use_mlock=False,
         verbose=True,
@@ -589,66 +588,6 @@ def format_messages_mistral(messages: List[Message]) -> str:
     
     return "".join(prompt_parts)
 
-# ===== CLASSE POUR STREAMING OPTIMISÉ =====
-class StreamingBuffer:
-    """Buffer intelligent pour optimiser le streaming des tokens"""
-    
-    def __init__(self, websocket: WebSocket):
-        self.ws = websocket
-        self.buffer = []
-        self.last_send_time = 0
-        self.min_tokens = 3  # Minimum de tokens avant envoi
-        self.max_delay_ms = 100  # Maximum 100ms d'attente
-        self.punctuation = {'.', '!', '?', ',', ';', ':', ')', ']', '}'}
-        
-    async def add_token(self, token: str, request_id: str):
-        """Ajouter un token au buffer et envoyer si nécessaire"""
-        self.buffer.append(token)
-        
-        # Conditions pour envoyer
-        should_send = False
-        
-        # 1. Assez de tokens
-        if len(self.buffer) >= self.min_tokens:
-            should_send = True
-            
-        # 2. Ponctuation trouvée
-        if any(p in token for p in self.punctuation):
-            should_send = True
-            
-        # 3. Timeout dépassé
-        if self.last_send_time > 0:
-            elapsed_ms = (time.time() - self.last_send_time) * 1000
-            if elapsed_ms >= self.max_delay_ms and self.buffer:
-                should_send = True
-        
-        if should_send:
-            await self.flush(request_id)
-    
-    async def flush(self, request_id: str):
-        """Envoyer tous les tokens bufferisés"""
-        if not self.buffer:
-            return
-            
-        combined_tokens = "".join(self.buffer)
-        
-        await self.ws.send_json({
-            "type": "stream_token",
-            "token": combined_tokens,
-            "request_id": request_id,
-            "timestamp": time.time(),
-            "batch_size": len(self.buffer)
-        })
-        
-        # Log pour debug streaming
-        logging.debug(f"[STREAM] Envoyé {len(self.buffer)} tokens: '{combined_tokens}'")
-        
-        self.buffer = []
-        self.last_send_time = time.time()
-        
-        # Force le flush du WebSocket
-        await asyncio.sleep(0)
-
 # ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -678,8 +617,8 @@ async def lifespan(app: FastAPI):
 # ===== APPLICATION FASTAPI =====
 app = FastAPI(
     title="Mixtral-8x7B GGUF API",
-    version="6.0.0",
-    description="API FastAPI pour Mixtral-8x7B avec streaming optimisé",
+    version="5.0.0",
+    description="API FastAPI pour Mixtral-8x7B avec streaming",
     lifespan=lifespan
 )
 
@@ -702,32 +641,29 @@ async def metrics():
 @app.get("/")
 async def root():
     return {
-        "message": "Mixtral-8x7B GGUF API with Optimized Streaming",
-        "version": "6.0.0",
+        "message": "Mixtral-8x7B GGUF API with Streaming",
         "status": "running" if llm is not None else "loading",
         "model": "Mixtral-8x7B-Instruct-v0.1.Q5_K_M.gguf",
         "model_loaded": llm is not None,
         "download_complete": download_complete,
         "download_in_progress": download_in_progress,
         "features": [
-            "Optimized streaming with intelligent buffering",
+            "Streaming responses",
             "Intelligent JSON parsing",
             "Natural conversation mode",
-            "Summary extraction endpoint",
-            "Prometheus metrics"
+            "Summary extraction endpoint"
         ],
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
-            "/ws": "WebSocket - Streaming chat endpoint with buffer optimization (requires token in query)",
-            "/ws/test": "WebSocket - Test streaming latency",
+            "/ws": "WebSocket - Streaming chat endpoint (requires token in query)",
             "/v1/summary": "POST - Extract structured summary from conversation",
             "/v1/models": "GET - List available models",
-            "/v1/warmup": "POST - Warmup model for faster first response",
             "/health": "GET - Health check",
             "/metrics": "GET - Prometheus metrics",
             "/download-status": "GET - Model download status"
         }
     }
+
 
 @app.get("/health")
 async def health_check():
@@ -738,7 +674,6 @@ async def health_check():
         "model_exists": os.path.exists(MODEL_PATH),
         "download_complete": download_complete,
         "download_in_progress": download_in_progress,
-        "streaming_optimization": "intelligent_buffering",
         "json_parse_stats": {
             "success": json_parse_success_total._value._value if hasattr(json_parse_success_total, '_value') else 0,
             "failure": json_parse_failure_total._value._value if hasattr(json_parse_failure_total, '_value') else 0
@@ -1022,7 +957,7 @@ async def debug_prompt(request: ChatCompletionRequest):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """Endpoint WebSocket avec streaming optimisé par buffer intelligent"""
+    """Endpoint WebSocket avec streaming pour fluidité conversationnelle"""
     if token != API_TOKEN:
         await websocket.close(code=1008, reason="Invalid token")
         return
@@ -1030,31 +965,14 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     await websocket.accept()
     fastapi_websocket_connections.inc()
     
-    # Désactiver Nagle's algorithm pour réduire la latence
-    try:
-        import socket as sock
-        transport = websocket._connection._transport
-        raw_socket = transport.get_extra_info('socket')
-        if raw_socket:
-            raw_socket.setsockopt(sock.IPPROTO_TCP, sock.TCP_NODELAY, 1)
-            logging.info("[WS] TCP_NODELAY activé pour réduire la latence")
-    except Exception as e:
-        logging.warning(f"[WS] Impossible d'activer TCP_NODELAY: {e}")
-    
     welcome_msg = {
         "type": "connection",
         "status": "connected",
         "model": "mixtral-8x7b",
         "model_loaded": llm is not None,
-        "streaming_mode": "intelligent_buffering",
-        "buffer_config": {
-            "min_tokens": 3,
-            "max_delay_ms": 100,
-            "punctuation_split": True
-        },
         "capabilities": [
             "French medical conversations",
-            "Optimized streaming responses",
+            "Streaming responses",
             "32K context"
         ]
     }
@@ -1084,74 +1002,40 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 
                 logging.info(f"[WS] Format utilisé: {'JSON' if use_json_format else 'Conversational'}")
                 
-                request_id = data.get("request_id", str(uuid.uuid4()))
-                
                 await websocket.send_json({
                     "type": "stream_start",
-                    "request_id": request_id,
-                    "timestamp": time.time()
+                    "request_id": data.get("request_id")
                 })
                 
-                # Créer le buffer intelligent
-                buffer = StreamingBuffer(websocket)
+                stream = llm(
+                    prompt,
+                    max_tokens=data.get("max_tokens", 200),
+                    temperature=data.get("temperature", 0.7),
+                    top_p=data.get("top_p", 0.9),
+                    stop=["</s>", "[INST]", "[/INST]"],
+                    stream=True
+                )
                 
-                # Créer une tâche qui force l'envoi périodique du buffer
-                async def periodic_flush():
-                    while True:
-                        await asyncio.sleep(0.1)  # Vérifier toutes les 100ms
-                        if buffer.buffer and (time.time() - buffer.last_send_time) > 0.1:
-                            await buffer.flush(request_id)
+                full_response = ""
+                tokens_count = 0
                 
-                flush_task = asyncio.create_task(periodic_flush())
-                
-                try:
-                    stream = llm(
-                        prompt,
-                        max_tokens=data.get("max_tokens", 200),
-                        temperature=data.get("temperature", 0.7),
-                        top_p=data.get("top_p", 0.9),
-                        stop=["</s>", "[INST]", "[/INST]"],
-                        stream=True
-                    )
+                for output in stream:
+                    token = output['choices'][0]['text']
+                    full_response += token
+                    tokens_count += 1
                     
-                    full_response = ""
-                    tokens_count = 0
-                    stream_start_time = time.time()
-                    
-                    for output in stream:
-                        token = output['choices'][0]['text']
-                        if token:  # Ignorer les tokens vides
-                            full_response += token
-                            tokens_count += 1
-                            
-                            # Ajouter au buffer (envoi automatique selon les règles)
-                            await buffer.add_token(token, request_id)
-                    
-                    # Envoyer les derniers tokens
-                    await buffer.flush(request_id)
-                    
-                finally:
-                    flush_task.cancel()
-                    try:
-                        await flush_task
-                    except asyncio.CancelledError:
-                        pass
-                
-                # Statistiques finales
-                stream_duration = time.time() - stream_start_time
-                tokens_per_second = tokens_count / stream_duration if stream_duration > 0 else 0
+                    await websocket.send_json({
+                        "type": "stream_token",
+                        "token": token,
+                        "request_id": data.get("request_id")
+                    })
                 
                 await websocket.send_json({
                     "type": "stream_end",
                     "full_response": full_response,
                     "tokens": tokens_count,
-                    "request_id": request_id,
-                    "duration": stream_duration,
-                    "tokens_per_second": tokens_per_second,
-                    "timestamp": time.time()
+                    "request_id": data.get("request_id")
                 })
-                
-                logging.info(f"[WS] Stream terminé: {tokens_count} tokens en {stream_duration:.2f}s ({tokens_per_second:.1f} t/s)")
                 
                 fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
                 
@@ -1168,100 +1052,6 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     finally:
         fastapi_websocket_connections.dec()
 
-@app.websocket("/ws/test")
-async def websocket_test(websocket: WebSocket):
-    """WebSocket de test pour vérifier le streaming et mesurer la latence"""
-    await websocket.accept()
-    
-    try:
-        # Message de bienvenue
-        await websocket.send_json({
-            "type": "info",
-            "message": "Test de streaming - Les tokens seront envoyés progressivement"
-        })
-        
-        # Simuler un streaming parfait pour tester la latence réseau
-        test_tokens = ["Bonjour", ",", " voici", " un", " test", " de", " streaming", " fluide", " et", " naturel", "."]
-        
-        await websocket.send_json({
-            "type": "stream_start",
-            "request_id": "test",
-            "timestamp": time.time()
-        })
-        
-        start_time = time.time()
-        for i, token in enumerate(test_tokens):
-            await websocket.send_json({
-                "type": "stream_token",
-                "token": token,
-                "index": i,
-                "timestamp": time.time(),
-                "elapsed": time.time() - start_time
-            })
-            await asyncio.sleep(0.05)  # 50ms entre tokens pour simuler la génération
-        
-        await websocket.send_json({
-            "type": "stream_end",
-            "request_id": "test",
-            "timestamp": time.time(),
-            "total_duration": time.time() - start_time,
-            "message": "Test terminé - Vérifiez que les tokens sont arrivés progressivement"
-        })
-        
-    except WebSocketDisconnect:
-        pass
-
-@app.get("/test/streaming-latency", dependencies=[Depends(verify_token)])
-async def test_streaming_latency():
-    """Test la latence de génération token par token"""
-    if llm is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    prompt = "<s>[INST] Compte de 1 à 5 [/INST]"
-    
-    # Test avec streaming
-    stream_start = time.time()
-    tokens = []
-    
-    stream = llm(prompt, max_tokens=20, temperature=0.1, stream=True)
-    
-    for output in stream:
-        token = output['choices'][0]['text']
-        if token:
-            tokens.append({
-                "token": token,
-                "time": time.time() - stream_start
-            })
-    
-    return {
-        "prompt": prompt,
-        "tokens": tokens,
-        "total_tokens": len(tokens),
-        "total_time": time.time() - stream_start,
-        "config": {
-            "n_batch": 512,
-            "streaming": True
-        },
-        "analysis": {
-            "avg_time_between_tokens": sum(t["time"] for t in tokens[1:]) / max(1, len(tokens)-1) if len(tokens) > 1 else 0,
-            "tokens_per_second": len(tokens) / (time.time() - stream_start) if tokens else 0
-        }
-    }
-
 if __name__ == "__main__":
     import uvicorn
-    
-    # Configuration optimisée pour le streaming
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8000,
-        # Options pour optimiser le streaming
-        loop="uvloop" if sys.platform != "win32" else "asyncio",
-        ws_ping_interval=20,  # Ping toutes les 20 secondes (réduit)
-        ws_ping_timeout=20,
-        limit_concurrency=1000,
-        backlog=2048,
-        # Log pour debug
-        log_level="info"
-    )
+    uvicorn.run(app, host="0.0.0.0", port=8000)
