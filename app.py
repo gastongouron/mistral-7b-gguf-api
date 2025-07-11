@@ -111,6 +111,7 @@ class ChatCompletionResponse(BaseModel):
 
 # Variable globale pour le modèle
 llm = None
+active_streams = {}  # Pour tracker les streams actifs et permettre l'annulation
 
 # ===== AUTHENTIFICATION =====
 security = HTTPBearer()
@@ -973,7 +974,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
         "capabilities": [
             "French medical conversations",
             "Streaming responses",
-            "32K context"
+            "32K context",
+            "Stream cancellation"  # NOUVEAU
         ]
     }
     await websocket.send_json(welcome_msg)
@@ -981,12 +983,26 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     try:
         while True:
             data = await websocket.receive_json()
+            
+            # NOUVEAU : Gérer cancel_stream
+            if data.get("type") == "cancel_stream":
+                request_id = data.get("request_id")
+                if request_id and request_id in active_streams:
+                    active_streams[request_id] = False  # Flag pour arrêter
+                    await websocket.send_json({
+                        "type": "stream_cancelled", 
+                        "request_id": request_id
+                    })
+                    logging.info(f"[WS] Stream {request_id} annulé")
+                continue
+            
             if llm is None:
                 await websocket.send_json({"type": "error", "error": "Model not loaded"})
                 continue
             
             try:
                 messages = [Message(**msg) for msg in data.get("messages", [])]
+                request_id = data.get("request_id")  # NOUVEAU : récupérer request_id
                 
                 # Log pour debug
                 logging.info(f"[WS] Messages reçus: {[(m.role, len(m.content)) for m in messages]}")
@@ -1004,7 +1020,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 
                 await websocket.send_json({
                     "type": "stream_start",
-                    "request_id": data.get("request_id")
+                    "request_id": request_id  # Utiliser la variable
                 })
                 
                 stream = llm(
@@ -1016,10 +1032,19 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     stream=True
                 )
                 
+                # NOUVEAU : Marquer le stream comme actif
+                if request_id:
+                    active_streams[request_id] = True
+                
                 full_response = ""
                 tokens_count = 0
                 
                 for output in stream:
+                    # NOUVEAU : Vérifier si on doit arrêter
+                    if request_id and not active_streams.get(request_id, True):
+                        logging.info(f"[WS] Stream {request_id} interrompu après {tokens_count} tokens")
+                        break
+                    
                     token = output['choices'][0]['text']
                     full_response += token
                     tokens_count += 1
@@ -1027,14 +1052,18 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     await websocket.send_json({
                         "type": "stream_token",
                         "token": token,
-                        "request_id": data.get("request_id")
+                        "request_id": request_id  # Utiliser la variable
                     })
+                
+                # NOUVEAU : Nettoyer
+                if request_id:
+                    active_streams.pop(request_id, None)
                 
                 await websocket.send_json({
                     "type": "stream_end",
                     "full_response": full_response,
                     "tokens": tokens_count,
-                    "request_id": data.get("request_id")
+                    "request_id": request_id  # Utiliser la variable
                 })
                 
                 fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
