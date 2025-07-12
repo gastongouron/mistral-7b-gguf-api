@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 API FastAPI pour servir le modèle Mixtral-8x7B GGUF avec llama-cpp-python
-Optimisé pour conversations médicales françaises avec streaming
-Version 5.0.0 avec streaming complet
+Optimisé pour conversations médicales françaises avec streaming et interruption
+Version 6.0.0 avec interruption asynchrone
 """
 import os
 import time
@@ -16,14 +16,17 @@ import socket
 import urllib.request
 import sys
 import subprocess
+import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator
 from llama_cpp import Llama
+from concurrent.futures import ThreadPoolExecutor
+import weakref
 
 # Import des métriques Prometheus
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
@@ -45,7 +48,7 @@ system_info.info({
     'model': 'mixtral-8x7b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '5.0.0'  # Version avec streaming
+    'version': '6.0.0'  # Version avec interruption asynchrone
 })
 
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
@@ -70,6 +73,8 @@ model_loading_duration_seconds = Gauge('model_loading_duration_seconds', 'Time t
 model_download_progress = Gauge('model_download_progress', 'Model download progress in percentage')
 json_parse_success_total = Counter('json_parse_success_total', 'Number of successful JSON parses')
 json_parse_failure_total = Counter('json_parse_failure_total', 'Number of failed JSON parses')
+stream_cancellation_total = Counter('stream_cancellation_total', 'Number of stream cancellations')
+stream_cancellation_latency_seconds = Histogram('stream_cancellation_latency_seconds', 'Time from cancellation request to actual stop')
 
 inference_queue = asyncio.Queue(maxsize=1000)
 download_in_progress = False
@@ -111,7 +116,87 @@ class ChatCompletionResponse(BaseModel):
 
 # Variable globale pour le modèle
 llm = None
-active_streams = {}  # Pour tracker les streams actifs et permettre l'annulation
+
+# ===== GESTIONNAIRE DE STREAMS INTERRUPTIBLES =====
+class StreamManager:
+    """Gère les streams actifs et leur interruption"""
+    def __init__(self):
+        self.active_streams = {}
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        self._lock = threading.Lock()
+    
+    def register_stream(self, request_id: str) -> threading.Event:
+        """Enregistre un nouveau stream et retourne son event de cancellation"""
+        cancel_event = threading.Event()
+        with self._lock:
+            self.active_streams[request_id] = {
+                'cancel_event': cancel_event,
+                'start_time': time.time(),
+                'tokens_generated': 0
+            }
+        return cancel_event
+    
+    def cancel_stream(self, request_id: str) -> bool:
+        """Annule un stream actif"""
+        with self._lock:
+            if request_id in self.active_streams:
+                cancel_time = time.time()
+                start_time = self.active_streams[request_id]['start_time']
+                self.active_streams[request_id]['cancel_event'].set()
+                stream_cancellation_total.inc()
+                stream_cancellation_latency_seconds.observe(cancel_time - start_time)
+                logging.info(f"[STREAM] Annulation demandée pour {request_id}")
+                return True
+        return False
+    
+    def unregister_stream(self, request_id: str):
+        """Retire un stream de la liste active"""
+        with self._lock:
+            if request_id in self.active_streams:
+                del self.active_streams[request_id]
+    
+    def update_token_count(self, request_id: str, count: int):
+        """Met à jour le nombre de tokens générés"""
+        with self._lock:
+            if request_id in self.active_streams:
+                self.active_streams[request_id]['tokens_generated'] = count
+    
+    async def generate_async(self, llm_model, prompt: str, request_id: str, **kwargs) -> AsyncGenerator[Dict, None]:
+        """Génère des tokens de manière asynchrone avec support d'interruption"""
+        cancel_event = self.register_stream(request_id)
+        
+        # Créer un générateur dans un thread séparé
+        def generate_with_cancellation():
+            try:
+                stream = llm_model(prompt, stream=True, **kwargs)
+                tokens_count = 0
+                
+                for output in stream:
+                    # Vérifier l'interruption à chaque token
+                    if cancel_event.is_set():
+                        logging.info(f"[STREAM] Interruption détectée pour {request_id} après {tokens_count} tokens")
+                        break
+                    
+                    tokens_count += 1
+                    self.update_token_count(request_id, tokens_count)
+                    yield output
+                    
+            except Exception as e:
+                logging.error(f"[STREAM] Erreur dans la génération: {str(e)}")
+                raise
+            finally:
+                self.unregister_stream(request_id)
+        
+        # Convertir le générateur synchrone en asynchrone
+        loop = asyncio.get_event_loop()
+        
+        for output in generate_with_cancellation():
+            # Permettre à asyncio de traiter d'autres tâches
+            await asyncio.sleep(0)
+            yield output
+
+# Instance globale du gestionnaire de streams
+stream_manager = StreamManager()
 
 # ===== AUTHENTIFICATION =====
 security = HTTPBearer()
@@ -614,12 +699,14 @@ async def lifespan(app: FastAPI):
         await metrics_task
     except asyncio.CancelledError:
         pass
+    # Fermer le thread pool executor
+    stream_manager.executor.shutdown(wait=True)
 
 # ===== APPLICATION FASTAPI =====
 app = FastAPI(
     title="Mixtral-8x7B GGUF API",
-    version="5.0.0",
-    description="API FastAPI pour Mixtral-8x7B avec streaming",
+    version="6.0.0",
+    description="API FastAPI pour Mixtral-8x7B avec streaming et interruption asynchrone",
     lifespan=lifespan
 )
 
@@ -642,7 +729,7 @@ async def metrics():
 @app.get("/")
 async def root():
     return {
-        "message": "Mixtral-8x7B GGUF API with Streaming",
+        "message": "Mixtral-8x7B GGUF API with Async Interruption",
         "status": "running" if llm is not None else "loading",
         "model": "Mixtral-8x7B-Instruct-v0.1.Q5_K_M.gguf",
         "model_loaded": llm is not None,
@@ -650,13 +737,15 @@ async def root():
         "download_in_progress": download_in_progress,
         "features": [
             "Streaming responses",
+            "Async stream interruption",
             "Intelligent JSON parsing",
             "Natural conversation mode",
             "Summary extraction endpoint"
         ],
+        "active_streams": len(stream_manager.active_streams),
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
-            "/ws": "WebSocket - Streaming chat endpoint (requires token in query)",
+            "/ws": "WebSocket - Streaming chat endpoint with interruption support (requires token in query)",
             "/v1/summary": "POST - Extract structured summary from conversation",
             "/v1/models": "GET - List available models",
             "/health": "GET - Health check",
@@ -675,9 +764,14 @@ async def health_check():
         "model_exists": os.path.exists(MODEL_PATH),
         "download_complete": download_complete,
         "download_in_progress": download_in_progress,
+        "active_streams": len(stream_manager.active_streams),
         "json_parse_stats": {
             "success": json_parse_success_total._value._value if hasattr(json_parse_success_total, '_value') else 0,
             "failure": json_parse_failure_total._value._value if hasattr(json_parse_failure_total, '_value') else 0
+        },
+        "stream_cancellation_stats": {
+            "total": stream_cancellation_total._value._value if hasattr(stream_cancellation_total, '_value') else 0,
+            "active_streams": list(stream_manager.active_streams.keys())
         }
     }
     if os.path.exists(MODEL_PATH):
@@ -958,7 +1052,7 @@ async def debug_prompt(request: ChatCompletionRequest):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """Endpoint WebSocket avec streaming pour fluidité conversationnelle"""
+    """Endpoint WebSocket avec streaming et interruption asynchrone"""
     if token != API_TOKEN:
         await websocket.close(code=1008, reason="Invalid token")
         return
@@ -975,7 +1069,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             "French medical conversations",
             "Streaming responses",
             "32K context",
-            "Stream cancellation"  # NOUVEAU
+            "Async stream cancellation"  # NOUVEAU
         ]
     }
     await websocket.send_json(welcome_msg)
@@ -984,16 +1078,17 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
         while True:
             data = await websocket.receive_json()
             
-            # NOUVEAU : Gérer cancel_stream
+            # Gérer cancel_stream
             if data.get("type") == "cancel_stream":
                 request_id = data.get("request_id")
-                if request_id and request_id in active_streams:
-                    active_streams[request_id] = False  # Flag pour arrêter
+                if request_id:
+                    cancelled = stream_manager.cancel_stream(request_id)
                     await websocket.send_json({
                         "type": "stream_cancelled", 
-                        "request_id": request_id
+                        "request_id": request_id,
+                        "success": cancelled
                     })
-                    logging.info(f"[WS] Stream {request_id} annulé")
+                    logging.info(f"[WS] Cancel stream {request_id}: {'success' if cancelled else 'not found'}")
                 continue
             
             if llm is None:
@@ -1002,13 +1097,12 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
             
             try:
                 messages = [Message(**msg) for msg in data.get("messages", [])]
-                request_id = data.get("request_id")  # NOUVEAU : récupérer request_id
+                request_id = data.get("request_id") or f"ws_{uuid.uuid4().hex[:8]}"
                 
                 # Log pour debug
-                logging.info(f"[WS] Messages reçus: {[(m.role, len(m.content)) for m in messages]}")
+                logging.info(f"[WS] Nouveau stream {request_id}: {[(m.role, len(m.content)) for m in messages]}")
                 
                 # Utiliser le formatteur conversationnel par défaut pour WebSocket
-                # Sauf si explicitement demandé autrement
                 use_json_format = data.get("format") == "json"
                 
                 if use_json_format:
@@ -1020,31 +1114,23 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 
                 await websocket.send_json({
                     "type": "stream_start",
-                    "request_id": request_id  # Utiliser la variable
+                    "request_id": request_id
                 })
                 
-                stream = llm(
+                # Utiliser le stream manager pour la génération asynchrone
+                full_response = ""
+                tokens_count = 0
+                start_time = time.time()
+                
+                async for output in stream_manager.generate_async(
+                    llm,
                     prompt,
+                    request_id,
                     max_tokens=data.get("max_tokens", 200),
                     temperature=data.get("temperature", 0.7),
                     top_p=data.get("top_p", 0.9),
-                    stop=["</s>", "[INST]", "[/INST]"],
-                    stream=True
-                )
-                
-                # NOUVEAU : Marquer le stream comme actif
-                if request_id:
-                    active_streams[request_id] = True
-                
-                full_response = ""
-                tokens_count = 0
-                
-                for output in stream:
-                    # NOUVEAU : Vérifier si on doit arrêter
-                    if request_id and not active_streams.get(request_id, True):
-                        logging.info(f"[WS] Stream {request_id} interrompu après {tokens_count} tokens")
-                        break
-                    
+                    stop=["</s>", "[INST]", "[/INST]"]
+                ):
                     token = output['choices'][0]['text']
                     full_response += token
                     tokens_count += 1
@@ -1052,21 +1138,34 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     await websocket.send_json({
                         "type": "stream_token",
                         "token": token,
-                        "request_id": request_id  # Utiliser la variable
+                        "request_id": request_id
                     })
                 
-                # NOUVEAU : Nettoyer
-                if request_id:
-                    active_streams.pop(request_id, None)
+                # Calculer les métriques
+                duration = time.time() - start_time
+                if duration > 0:
+                    tps = tokens_count / duration
+                    fastapi_inference_tokens_per_second.set(tps)
+                
+                # Vérifier si le stream a été interrompu
+                was_cancelled = request_id not in stream_manager.active_streams
                 
                 await websocket.send_json({
                     "type": "stream_end",
                     "full_response": full_response,
                     "tokens": tokens_count,
-                    "request_id": request_id  # Utiliser la variable
+                    "request_id": request_id,
+                    "cancelled": was_cancelled,
+                    "duration": duration,
+                    "tokens_per_second": tps if duration > 0 else 0
                 })
                 
-                fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
+                logging.info(f"[WS] Stream {request_id} terminé: {tokens_count} tokens en {duration:.2f}s (annulé: {was_cancelled})")
+                
+                fastapi_inference_requests_total.labels(
+                    model="mixtral-8x7b", 
+                    status="cancelled" if was_cancelled else "success"
+                ).inc()
                 
             except Exception as e:
                 logging.error(f"[WS] Erreur: {str(e)}", exc_info=True)
