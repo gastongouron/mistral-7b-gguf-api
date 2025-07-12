@@ -31,8 +31,8 @@ import weakref
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
 
 # Configuration pour Qwen2.5-32B
-MODEL_PATH = "/workspace/models/Qwen2.5-72B-Instruct-Q3_K_M.gguf"
-MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-72B-Instruct-GGUF/resolve/main/Qwen2.5-72B-Instruct-Q3_K_M.gguf"
+MODEL_PATH = "/workspace/models/Qwen2.5-32B-Instruct-Q4_K_M.gguf"
+MODEL_URL = "https://huggingface.co/Qwen/Qwen2.5-32B-Instruct-GGUF/resolve/main/qwen2_5-32b-instruct-q4_k_m.gguf"
 
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 
@@ -583,11 +583,11 @@ def cleanup_old_models():
         free_gb = stat.free / (1024**3)
         print(f"\n💾 Espace libre après nettoyage: {free_gb:.1f} GB")
         
-        # Vérifier si on a assez d'espace pour le nouveau modèle (Q3_K_M ~40GB)
-        required_gb = 45  # 40GB pour le modèle + marge
+        # Vérifier si on a assez d'espace pour le nouveau modèle (Q4_K_M ~20GB)
+        required_gb = 25  # 20GB pour le modèle + marge
         if free_gb < required_gb:
             print(f"⚠️  ATTENTION: Seulement {free_gb:.1f} GB disponibles")
-            print(f"   Le modèle Qwen2.5-72B-Q3_K_M nécessite ~40 GB")
+            print(f"   Le modèle Qwen2.5-32B-Q4_K_M nécessite ~20 GB")
             print(f"   Il faudrait libérer encore {required_gb - free_gb:.1f} GB")
         else:
             print(f"✅ Espace suffisant pour télécharger le nouveau modèle")
@@ -606,7 +606,7 @@ def download_model_if_needed():
     
     if os.path.exists(MODEL_PATH):
         file_size = os.path.getsize(MODEL_PATH)
-        expected_size = 40_000_000_000  # ~40 GB pour Q3_K_M
+        expected_size = 18_500_000_000  # ~18.5 GB pour Q4_K_M
         if file_size > expected_size * 0.95:  # 95% de la taille attendue
             print(f"✅ Modèle trouvé: {file_size / (1024**3):.1f} GB")
             download_complete = True
@@ -685,12 +685,12 @@ def download_model_if_needed():
         download_in_progress = False
 
 def load_model():
-    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-72B"""
+    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-32B"""
     global llm
     
     download_model_if_needed()
     
-    print(f"Chargement du modèle Qwen2.5-72B depuis {MODEL_PATH}...")
+    print(f"Chargement du modèle Qwen2.5-32B depuis {MODEL_PATH}...")
     
     try:
         import pynvml
@@ -703,37 +703,36 @@ def load_model():
         print(f"VRAM totale: {vram_gb:.1f} GB")
         print(f"VRAM libre: {vram_free_gb:.1f} GB")
         
-        # Qwen2.5-72B Q3_K_M nécessite environ 40GB VRAM
-        if vram_gb >= 80:  # A100 80GB ou H100
+        # Qwen2.5-32B Q4_K_M nécessite environ 20GB VRAM
+        if vram_gb >= 48:  # L40 48GB ou mieux
             n_gpu_layers = -1  # Tout sur GPU
             print("Configuration: Modèle ENTIÈREMENT sur GPU (optimal)")
-        elif vram_gb >= 48:  # L40 48GB
-            # Q3_K_M ~40GB, on peut mettre la plupart sur GPU
-            n_gpu_layers = 60  # Environ 75% des couches
-            print(f"Configuration: {n_gpu_layers} couches sur GPU (L40 détecté)")
-        elif vram_gb >= 40:
-            n_gpu_layers = 50
+        elif vram_gb >= 24:  # RTX 3090/4090
+            n_gpu_layers = 50  # La plupart des couches
+            print(f"Configuration: {n_gpu_layers} couches sur GPU")
+        elif vram_gb >= 20:
+            n_gpu_layers = 40
             print(f"Configuration: {n_gpu_layers} couches sur GPU")
         else:
             # ALERTE : Pas assez de VRAM !
             print("="*60)
             print("⚠️  ALERTE PERFORMANCE ⚠️")
             print(f"VRAM insuffisante: {vram_gb:.1f}GB")
-            print("Qwen2.5-72B Q3_K_M nécessite 40GB+ de VRAM")
-            print("Le modèle sera TRÈS LENT sur CPU!")
+            print("Qwen2.5-32B Q4_K_M nécessite 20GB+ de VRAM")
+            print("Le modèle sera LENT sur CPU!")
             print("="*60)
-            n_gpu_layers = int(vram_gb * 1.2)  # Essayer de mettre ce qu'on peut
+            n_gpu_layers = int(vram_gb * 2)  # Essayer de mettre ce qu'on peut
             
     except Exception as e:
         print(f"⚠️ Impossible de détecter la VRAM: {e}")
         n_gpu_layers = -1  # Tenter quand même
     
     # Calculer le nombre de couches du modèle
-    # Qwen2.5-72B a 80 couches
-    total_layers = 80
+    # Qwen2.5-32B a environ 60 couches
+    total_layers = 60
     
     print(f"\nConfiguration finale:")
-    print(f"- Modèle: Qwen2.5-72B Q3_K_M")
+    print(f"- Modèle: Qwen2.5-32B Q4_K_M")
     print(f"- Couches totales: {total_layers}")
     print(f"- Couches sur GPU: {n_gpu_layers if n_gpu_layers != -1 else 'TOUTES'}")
     print(f"- Couches sur CPU: {0 if n_gpu_layers == -1 else max(0, total_layers - n_gpu_layers)}")
@@ -761,6 +760,7 @@ def load_model():
     
     load_time = time.time() - start_load
     print(f"\n✅ Modèle chargé en {load_time:.1f} secondes")
+    model_loaded.set(1)
     
     # Test de génération rapide
     print("\n🧪 Test de performance...")
@@ -778,7 +778,9 @@ def load_model():
         print("   Première réponse prendra plus de 5 secondes")
         print("   Considérez une quantization plus légère ou plus de VRAM")
     
-    return llm
+    print(f"\n{'='*60}")
+    print("✅ Modèle Qwen2.5-32B chargé avec succès!")
+    print(f"{'='*60}\n")
     
 # ===== LIFESPAN =====
 @asynccontextmanager
@@ -857,7 +859,9 @@ async def root():
             "/v1/models": "GET - List available models",
             "/health": "GET - Health check",
             "/metrics": "GET - Prometheus metrics",
-            "/download-status": "GET - Model download status"
+            "/download-status": "GET - Model download status",
+            "/v1/cleanup": "POST - Clean old models",
+            "/v1/disk-usage": "GET - Check disk usage"
         }
     }
 
@@ -898,6 +902,131 @@ async def download_status():
         status["expected_size_gb"] = 18.5  # Q4_K_M
     return status
 
+@app.post("/v1/cleanup", dependencies=[Depends(verify_token)])
+async def cleanup_models(keep_current: bool = True):
+    """Nettoie les anciens modèles GGUF pour libérer de l'espace"""
+    try:
+        models_dir = "/workspace/models"
+        
+        # Lister tous les fichiers GGUF
+        import glob
+        all_models = glob.glob(os.path.join(models_dir, "*.gguf"))
+        
+        if not all_models:
+            return {
+                "status": "nothing_to_clean",
+                "message": "No GGUF models found",
+                "space_freed_gb": 0
+            }
+        
+        # Calculer l'espace avant
+        import shutil
+        stat_before = shutil.disk_usage(models_dir)
+        
+        # Identifier le modèle actuel
+        current_model_name = os.path.basename(MODEL_PATH)
+        
+        cleaned_models = []
+        space_freed = 0
+        errors = []
+        
+        for model_file in all_models:
+            model_name = os.path.basename(model_file)
+            
+            # Garder le modèle actuel si demandé
+            if keep_current and model_name == current_model_name:
+                continue
+            
+            try:
+                file_size = os.path.getsize(model_file)
+                os.remove(model_file)
+                cleaned_models.append({
+                    "name": model_name,
+                    "size_gb": file_size / (1024**3)
+                })
+                space_freed += file_size
+            except Exception as e:
+                errors.append({
+                    "model": model_name,
+                    "error": str(e)
+                })
+        
+        # Calculer l'espace après
+        stat_after = shutil.disk_usage(models_dir)
+        
+        return {
+            "status": "success",
+            "cleaned_models": cleaned_models,
+            "space_freed_gb": space_freed / (1024**3),
+            "disk_usage": {
+                "before": {
+                    "free_gb": stat_before.free / (1024**3),
+                    "used_gb": stat_before.used / (1024**3),
+                    "total_gb": stat_before.total / (1024**3)
+                },
+                "after": {
+                    "free_gb": stat_after.free / (1024**3),
+                    "used_gb": stat_after.used / (1024**3),
+                    "total_gb": stat_after.total / (1024**3)
+                }
+            },
+            "errors": errors if errors else None
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/disk-usage")
+async def disk_usage():
+    """Vérifie l'utilisation du disque"""
+    try:
+        import shutil
+        
+        # Espace disque général
+        stat = shutil.disk_usage("/")
+        workspace_stat = shutil.disk_usage("/workspace")
+        
+        # Lister les modèles
+        import glob
+        models = []
+        models_dir = "/workspace/models"
+        
+        if os.path.exists(models_dir):
+            for model_file in glob.glob(os.path.join(models_dir, "*.gguf")):
+                try:
+                    size = os.path.getsize(model_file)
+                    models.append({
+                        "name": os.path.basename(model_file),
+                        "size_gb": size / (1024**3),
+                        "size_bytes": size
+                    })
+                except:
+                    pass
+        
+        models.sort(key=lambda x: x['size_bytes'], reverse=True)
+        
+        return {
+            "root_disk": {
+                "free_gb": stat.free / (1024**3),
+                "used_gb": stat.used / (1024**3),
+                "total_gb": stat.total / (1024**3),
+                "usage_percent": (stat.used / stat.total) * 100
+            },
+            "workspace_disk": {
+                "free_gb": workspace_stat.free / (1024**3),
+                "used_gb": workspace_stat.used / (1024**3),
+                "total_gb": workspace_stat.total / (1024**3),
+                "usage_percent": (workspace_stat.used / workspace_stat.total) * 100
+            },
+            "models": models,
+            "total_models_size_gb": sum(m['size_gb'] for m in models),
+            "required_for_new_model_gb": 20,  # Qwen2.5-32B Q4_K_M
+            "can_download_new_model": workspace_stat.free / (1024**3) > 25
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/v1/models", dependencies=[Depends(verify_token)])
 async def list_models():
     start_time = time.time()
@@ -934,33 +1063,17 @@ async def create_summary(request: dict):
     try:
         messages = request.get("messages", [])
         
-        # Prompt adapté pour Qwen
-        extraction_prompt = f"""<|im_start|>system
-Analyse cette conversation médicale et extrais UNIQUEMENT les informations explicitement fournies.
-Retourne un JSON avec ces champs (null si non fourni) :
-
-{{
-  "nom": "valeur ou null",
-  "prenom": "valeur ou null", 
-  "dateNaissance": "format JJ/MM/AAAA ou null",
-  "dejaPatient": "oui/non/null",
-  "praticien": "Dr Nom ou null",
-  "motif": "description ou null",
-  "resume": "résumé court de la demande",
-  "categorie": "appointment_create/emergency/etc"
-}}
-<|im_end|>
-<|im_start|>user
-Conversation à analyser:
-{chr(10).join([f"{m['role']}: {m['content']}" for m in messages])}
-
-Retourne UNIQUEMENT le JSON, sans texte avant ou après.
-<|im_end|>
-<|im_start|>assistant
-"""
-
+        # Convertir les messages en objets Message pour la validation
+        validated_messages = [Message(**msg) for msg in messages]
+        
+        # Utiliser le formatter Qwen pour construire le prompt
+        prompt = format_messages_qwen(validated_messages)
+        
+        # Log pour debug
+        logging.info(f"[SUMMARY] Extraction avec {len(validated_messages)} messages")
+        
         response = llm(
-            extraction_prompt,
+            prompt,
             max_tokens=500,
             temperature=0.1,
             top_p=0.9,
@@ -969,6 +1082,10 @@ Retourne UNIQUEMENT le JSON, sans texte avant ou après.
         
         result_text = response['choices'][0]['text'].strip()
         parsed_result = smart_json_parse(result_text)
+        
+        # Si le parsing a échoué, on retourne quand même une structure
+        if "error" in parsed_result:
+            logging.warning(f"[SUMMARY] Parsing JSON échoué: {parsed_result['error']}")
         
         return {
             "status": "success",
@@ -1165,7 +1282,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
         "capabilities": [
             "French medical conversations",
             "Streaming responses",
-            "8K context",
+            "2K context window",
             "Async stream cancellation",
             "Better instruction following"
         ]
