@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
 """
-API FastAPI pour servir le modèle Mixtral-8x7B GGUF avec llama-cpp-python
+API FastAPI pour servir le modèle Qwen2.5-32B GGUF avec llama-cpp-python
 Optimisé pour conversations médicales françaises avec streaming et interruption
-Version 6.0.0 avec interruption asynchrone
+Version 7.0.0 - Qwen Edition
 """
 import os
 import time
@@ -31,9 +30,10 @@ import weakref
 # Import des métriques Prometheus
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
 
-# Configuration pour Mixtral-8x7B
-MODEL_PATH = "/workspace/models/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf"
-MODEL_URL = "https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf"
+# Configuration pour Qwen2.5-32B Q8_0 (meilleure qualité pour 94GB RAM)
+MODEL_PATH = "/workspace/models/Qwen2.5-32B-Instruct-Q8_0.gguf"
+MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q8_0.gguf"
+
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 
 # Configuration du logging
@@ -45,10 +45,10 @@ logging.basicConfig(
 # ===== MÉTRIQUES PROMETHEUS =====
 system_info = Info('fastapi_system', 'System information')
 system_info.info({
-    'model': 'mixtral-8x7b',
+    'model': 'qwen2.5-32b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '6.0.0'  # Version avec interruption asynchrone
+    'version': '7.0.0'  # Version Qwen
 })
 
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
@@ -86,11 +86,12 @@ class Message(BaseModel):
     content: str
 
 class ChatCompletionRequest(BaseModel):
-    model: str = "mixtral-8x7b"
+    model: str = "qwen2.5-32b"
     messages: List[Message]
     temperature: Optional[float] = 0.1
     max_tokens: Optional[int] = 4096
     top_p: Optional[float] = 0.9
+    top_k: Optional[int] = None  # Ajout pour support top_k
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
     response_format: Optional[Dict[str, str]] = None
@@ -291,33 +292,22 @@ async def metrics_update_task():
         fastapi_inference_queue_size.set(inference_queue.qsize())
         await asyncio.sleep(5)
 
-# ===== PARSING JSON AMÉLIORÉ =====
-def format_messages_mistral_conversational(messages: List[Message]) -> str:
-    """Formater les messages pour une conversation naturelle sans JSON"""
-    prompt_parts = []
-    
-    for i, message in enumerate(messages):
+# ===== FORMATTERS POUR QWEN =====
+def format_messages_qwen(messages: List[Message]) -> str:
+    """Format ChatML pour Qwen2.5"""
+    prompt = ""
+    for message in messages:
         if message.role == "system":
-            # Premier message système sans <s> au début
-            if i == 0:
-                prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
-            else:
-                prompt_parts.append(f"[INST] {message.content} [/INST]")
+            prompt += f"<|im_start|>system\n{message.content}<|im_end|>\n"
         elif message.role == "user":
-            # Ajouter <s> seulement si ce n'est pas le premier message
-            if i > 0:
-                prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
-            else:
-                prompt_parts.append(f"[INST] {message.content} [/INST]")
+            prompt += f"<|im_start|>user\n{message.content}<|im_end|>\n"
         elif message.role == "assistant":
-            prompt_parts.append(f" {message.content}</s>")
-    
-    # S'assurer qu'on commence bien par <s>
-    if prompt_parts and not prompt_parts[0].startswith("<s>"):
-        prompt_parts[0] = "<s>" + prompt_parts[0]
-    
-    return "".join(prompt_parts)
+            prompt += f"<|im_start|>assistant\n{message.content}<|im_end|>\n"
+    # Ajouter le début de la réponse assistant
+    prompt += "<|im_start|>assistant\n"
+    return prompt
 
+# ===== PARSING JSON AMÉLIORÉ =====
 def clean_escaped_json(text: str) -> str:
     """Nettoie les caractères d'échappement dans le JSON"""
     text = text.replace(r'\_', '_')
@@ -471,6 +461,7 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
         print("   Définissez la variable HF_TOKEN pour éviter les erreurs 429")
         print("   export HF_TOKEN='votre_token_ici'")
     
+    # Pour Qwen, essayer d'abord avec huggingface-cli
     if hf_token and subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0:
         print("🔑 Token HuggingFace détecté, utilisation de huggingface-cli...")
         try:
@@ -479,8 +470,8 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
             
             hf_cmd = [
                 "huggingface-cli", "download",
-                "TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF",
-                "mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf",
+                "bartowski/Qwen2.5-32B-Instruct-GGUF",
+                "Qwen2.5-32B-Instruct-Q8_0.gguf",
                 "--local-dir", os.path.dirname(dest),
                 "--local-dir-use-symlinks", "False"
             ]
@@ -495,6 +486,7 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
         except Exception as e:
             print(f"⚠️ Erreur avec huggingface-cli: {e}")
     
+    # Fallback sur les méthodes alternatives
     for attempt in range(max_retries):
         try:
             if attempt > 0:
@@ -553,18 +545,74 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
             print("   export HF_TOKEN='votre_token_huggingface'")
         return False
 
+def cleanup_old_models():
+    """Nettoie les anciens modèles GGUF avant de télécharger le nouveau"""
+    models_dir = "/workspace/models"
+    
+    print(f"\n{'='*60}")
+    print("🧹 NETTOYAGE DES ANCIENS MODÈLES")
+    print(f"{'='*60}")
+    
+    try:
+        # Lister tous les fichiers GGUF
+        import glob
+        old_models = glob.glob(os.path.join(models_dir, "*.gguf"))
+        
+        if not old_models:
+            print("✅ Aucun ancien modèle trouvé")
+            return
+        
+        # Calculer l'espace utilisé
+        total_size = sum(os.path.getsize(f) for f in old_models)
+        print(f"📊 Espace utilisé par les anciens modèles: {total_size / (1024**3):.1f} GB")
+        
+        # Supprimer les anciens modèles SAUF celui qu'on veut télécharger
+        target_model = os.path.basename(MODEL_PATH)
+        for model_file in old_models:
+            if os.path.basename(model_file) != target_model:
+                print(f"🗑️  Suppression de: {os.path.basename(model_file)}")
+                try:
+                    os.remove(model_file)
+                    print(f"   ✅ Supprimé")
+                except Exception as e:
+                    print(f"   ❌ Erreur: {e}")
+        
+        # Vérifier l'espace libre après nettoyage
+        import shutil
+        stat = shutil.disk_usage(models_dir)
+        free_gb = stat.free / (1024**3)
+        print(f"\n💾 Espace libre après nettoyage: {free_gb:.1f} GB")
+        
+        # Vérifier si on a assez d'espace pour le nouveau modèle (Q8_0 ~34GB)
+        required_gb = 40  # 34GB pour le modèle + marge
+        if free_gb < required_gb:
+            print(f"⚠️  ATTENTION: Seulement {free_gb:.1f} GB disponibles")
+            print(f"   Le modèle Qwen2.5-32B-Q8_0 nécessite ~34 GB")
+            print(f"   Il faudrait libérer encore {required_gb - free_gb:.1f} GB")
+        else:
+            print(f"✅ Espace suffisant pour télécharger le nouveau modèle")
+            
+    except Exception as e:
+        print(f"❌ Erreur lors du nettoyage: {e}")
+        
+    print(f"{'='*60}\n")
+
 def download_model_if_needed():
     """Télécharger le modèle au premier démarrage si nécessaire"""
     global download_in_progress, download_complete
     
+    # NETTOYER LES ANCIENS MODÈLES D'ABORD
+    cleanup_old_models()
+    
     if os.path.exists(MODEL_PATH):
         file_size = os.path.getsize(MODEL_PATH)
-        if file_size > 30_000_000_000:
+        expected_size = 34_000_000_000  # ~34 GB pour Q8_0
+        if file_size > expected_size * 0.95:  # 95% de la taille attendue
             print(f"✅ Modèle trouvé: {file_size / (1024**3):.1f} GB")
             download_complete = True
             return
         else:
-            print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")
+            print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")    
     
     if download_in_progress:
         print("⏳ Téléchargement déjà en cours...")
@@ -574,15 +622,15 @@ def download_model_if_needed():
     
     urls = [
         MODEL_URL,
-        "https://huggingface.co/TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf?download=true",
+        "https://huggingface.co/Qwen/Qwen2.5-32B-Instruct-GGUF/resolve/main/qwen2_5-32b-instruct-q4_k_m.gguf?download=true",
     ]
     
     print(f"\n{'='*60}")
-    print(f"📥 TÉLÉCHARGEMENT DU MODÈLE MIXTRAL-8X7B")
+    print(f"📥 TÉLÉCHARGEMENT DU MODÈLE QWEN2.5-32B")
     print(f"{'='*60}")
-    print(f"📦 Taille: ~32.9 GB")
+    print(f"📦 Taille: ~34 GB (Q8_0 quantization - meilleure qualité)")
     print(f"📍 Destination: {MODEL_PATH}")
-    print(f"⏱️ Temps estimé: 20-40 minutes")
+    print(f"⏱️ Temps estimé: 20-30 minutes")
     print(f"{'='*60}\n")
     
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
@@ -608,7 +656,7 @@ def download_model_if_needed():
         file_size = os.path.getsize(MODEL_PATH)
         print(f"📦 Taille du fichier: {file_size / (1024**3):.1f} GB")
         
-        if file_size < 30_000_000_000:
+        if file_size < 32_000_000_000:
             raise Exception(f"Fichier trop petit: {file_size} bytes")
         
         download_complete = True
@@ -629,7 +677,7 @@ def download_model_if_needed():
         print(f"   wget -c '{MODEL_URL}' -O {MODEL_PATH}")
         print(f"\n3. Ou utilisez huggingface-cli :")
         print(f"   pip install huggingface-hub")
-        print(f"   huggingface-cli download TheBloke/Mixtral-8x7B-Instruct-v0.1-GGUF mixtral-8x7b-instruct-v0.1.Q5_K_M.gguf --local-dir /workspace/models/")
+        print(f"   huggingface-cli download bartowski/Qwen2.5-32B-Instruct-GGUF Qwen2.5-32B-Instruct-Q8_0.gguf --local-dir /workspace/models/")
         print("\n" + "="*60)
         
         raise
@@ -637,12 +685,12 @@ def download_model_if_needed():
         download_in_progress = False
 
 def load_model():
-    """Charger le modèle GGUF avec configuration optimale pour Mixtral-8x7B"""
+    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-32B"""
     global llm
     
     download_model_if_needed()
     
-    print(f"Chargement du modèle Mixtral-8x7B depuis {MODEL_PATH}...")
+    print(f"Chargement du modèle Qwen2.5-32B Q8_0 depuis {MODEL_PATH}...")
     
     try:
         import pynvml
@@ -650,71 +698,90 @@ def load_model():
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         vram_gb = mem_info.total / (1024**3)
-        print(f"VRAM disponible: {vram_gb:.1f} GB")
+        vram_free_gb = mem_info.free / (1024**3)
         
-        if vram_gb >= 40:
-            n_gpu_layers = -1
-            print("Configuration: Modèle entièrement sur GPU (recommandé)")
-        elif vram_gb >= 24:
-            n_gpu_layers = 28
-            print("Configuration: 28 couches sur GPU")
+        print(f"VRAM totale: {vram_gb:.1f} GB")
+        print(f"VRAM libre: {vram_free_gb:.1f} GB")
+        
+        # Qwen2.5-32B Q8_0 nécessite environ 34GB VRAM
+        if vram_gb >= 48:  # L40 48GB
+            n_gpu_layers = -1  # Tout sur GPU
+            print("Configuration: Modèle ENTIÈREMENT sur GPU (L40 détecté)")
+        elif vram_gb >= 40:
+            n_gpu_layers = 55  # La plupart des couches
+            print(f"Configuration: {n_gpu_layers} couches sur GPU")
+        elif vram_gb >= 34:
+            n_gpu_layers = 50
+            print(f"Configuration: {n_gpu_layers} couches sur GPU")
         else:
-            n_gpu_layers = 16
-            print(f"⚠️ VRAM limitée ({vram_gb:.1f}GB), performance réduite (16 couches sur GPU)")
+            print("="*60)
+            print("⚠️  ALERTE PERFORMANCE ⚠️")
+            print(f"VRAM insuffisante: {vram_gb:.1f}GB")
+            print("Qwen2.5-32B Q8_0 nécessite 34GB+ de VRAM")
+            print("="*60)
+            n_gpu_layers = int((vram_gb / 34) * 60)  # Proportionnel
+            
     except Exception as e:
-        n_gpu_layers = -1
-        print(f"Impossible de détecter la VRAM ({e}), tentative de chargement complet sur GPU")
+        print(f"⚠️ Impossible de détecter la VRAM: {e}")
+        print("Tentative de chargement complet sur GPU quand même...")
+        n_gpu_layers = -1  # IMPORTANT : Tenter sur GPU même si détection échoue !
+    
+    # Calculer le nombre de couches du modèle
+    # Qwen2.5-32B a environ 60 couches
+    total_layers = 60
+    
+    print(f"\nConfiguration finale:")
+    print(f"- Modèle: Qwen2.5-32B Q8_0")
+    print(f"- Couches totales: {total_layers}")
+    print(f"- Couches sur GPU: {n_gpu_layers if n_gpu_layers != -1 else 'TOUTES'}")
+    print(f"- Couches sur CPU: {0 if n_gpu_layers == -1 else max(0, total_layers - n_gpu_layers)}")
+    
+    start_load = time.time()
     
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=32768,
-        n_threads=12,
-        n_gpu_layers=n_gpu_layers,
-        n_batch=512,
+        n_ctx=4096,  # Contexte raisonnable pour performance
+        n_threads=8,  # Threads CPU pour les parties sur CPU
+        n_gpu_layers=n_gpu_layers,  # UTILISER LE GPU !
+        n_batch=512,  # Batch optimal
         use_mmap=True,
-        use_mlock=False,
+        use_mlock=False,  # False pour GPU
         verbose=True,
-        seed=42
+        seed=42,
+        # Paramètres Qwen
+        rope_freq_base=1000000,
+        rope_freq_scale=1.0,
+        # Optimisations GPU
+        f16_kv=True,  # Float16 pour GPU
+        logits_all=False,
+        vocab_only=False
     )
     
-    print("Modèle Mixtral-8x7B chargé avec succès!")
-    print(f"Configuration: {n_gpu_layers} couches GPU, contexte 32K tokens")
-
-def format_messages_mistral(messages: List[Message]) -> str:
-    """Formater les messages pour Mistral avec support JSON amélioré"""
-    prompt_parts = ["<s>"]
-    has_system_prompt = False
-    system_mentions_json = False
+    load_time = time.time() - start_load
+    print(f"\n✅ Modèle chargé en {load_time:.1f} secondes")
+    model_loaded.set(1)
     
-    # Parcourir tous les messages pour construire le prompt
-    for i, message in enumerate(messages):
-        if message.role == "system":
-            # Utiliser le prompt système fourni par VoxEngine
-            system_content = message.content
-            prompt_parts.append(f"[INST] {system_content} [/INST]")
-            has_system_prompt = True
-            # Vérifier si le système mentionne JSON
-            if "json" in system_content.lower() or "JSON" in system_content:
-                system_mentions_json = True
-                
-        elif message.role == "user":
-            if i == 0 and not has_system_prompt:
-                # Premier message utilisateur sans prompt système
-                prompt_parts.append(f"[INST] {message.content} [/INST]")
-            else:
-                # Messages utilisateur suivants
-                prompt_parts.append(f"<s>[INST] {message.content} [/INST]")
-                
-        elif message.role == "assistant":
-            # Réponses de l'assistant
-            prompt_parts.append(f" {message.content}</s>")
+    # Test de performance
+    print("\n🧪 Test de performance...")
+    test_start = time.time()
+    test_prompt = "<|im_start|>user\nBonjour<|im_end|>\n<|im_start|>assistant\n"
     
-    # S'assurer que le prompt se termine correctement
-    if not prompt_parts[-1].strip().endswith("</s>") and not prompt_parts[-1].strip().endswith("[/INST]"):
-        prompt_parts.append(" ")
+    result = llm(test_prompt, max_tokens=10, temperature=0.1)
+    test_time = time.time() - test_start
     
-    return "".join(prompt_parts)
-
+    print(f"⏱️ Temps pour 10 tokens: {test_time:.2f}s")
+    print(f"📊 Vitesse: {10/test_time:.1f} tokens/seconde")
+    
+    if test_time > 2:
+        print("\n⚠️ Performance limitée")
+        print("   Vérifiez que le modèle est bien sur GPU")
+    else:
+        print("\n✅ Excellente performance GPU!")
+    
+    print(f"\n{'='*60}")
+    print("✅ Qwen2.5-32B Q8_0 chargé avec succès!")
+    print(f"{'='*60}\n")
+    
 # ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -745,9 +812,9 @@ async def lifespan(app: FastAPI):
 
 # ===== APPLICATION FASTAPI =====
 app = FastAPI(
-    title="Mixtral-8x7B GGUF API",
-    version="6.0.0",
-    description="API FastAPI pour Mixtral-8x7B avec streaming et interruption asynchrone",
+    title="Qwen2.5-32B GGUF API",
+    version="7.0.0",
+    description="API FastAPI pour Qwen2.5-32B avec streaming et interruption asynchrone",
     lifespan=lifespan
 )
 
@@ -770,9 +837,9 @@ async def metrics():
 @app.get("/")
 async def root():
     return {
-        "message": "Mixtral-8x7B GGUF API with Async Interruption",
+        "message": "Qwen2.5-32B GGUF API with Async Interruption",
         "status": "running" if llm is not None else "loading",
-        "model": "Mixtral-8x7B-Instruct-v0.1.Q5_K_M.gguf",
+        "model": "Qwen2.5-32B-Instruct-Q8_0.gguf",
         "model_loaded": llm is not None,
         "download_complete": download_complete,
         "download_in_progress": download_in_progress,
@@ -781,7 +848,8 @@ async def root():
             "Async stream interruption",
             "Intelligent JSON parsing",
             "Natural conversation mode",
-            "Summary extraction endpoint"
+            "Summary extraction endpoint",
+            "Better instruction following than Mixtral"
         ],
         "active_streams": len(stream_manager.active_streams),
         "endpoints": {
@@ -791,7 +859,9 @@ async def root():
             "/v1/models": "GET - List available models",
             "/health": "GET - Health check",
             "/metrics": "GET - Prometheus metrics",
-            "/download-status": "GET - Model download status"
+            "/download-status": "GET - Model download status",
+            "/v1/cleanup": "POST - Clean old models",
+            "/v1/disk-usage": "GET - Check disk usage"
         }
     }
 
@@ -829,8 +899,133 @@ async def download_status():
     }
     if os.path.exists(MODEL_PATH):
         status["current_size_gb"] = os.path.getsize(MODEL_PATH) / (1024**3)
-        status["expected_size_gb"] = 32.9
+        status["expected_size_gb"] = 34.0  # Q8_0
     return status
+
+@app.post("/v1/cleanup", dependencies=[Depends(verify_token)])
+async def cleanup_models(keep_current: bool = True):
+    """Nettoie les anciens modèles GGUF pour libérer de l'espace"""
+    try:
+        models_dir = "/workspace/models"
+        
+        # Lister tous les fichiers GGUF
+        import glob
+        all_models = glob.glob(os.path.join(models_dir, "*.gguf"))
+        
+        if not all_models:
+            return {
+                "status": "nothing_to_clean",
+                "message": "No GGUF models found",
+                "space_freed_gb": 0
+            }
+        
+        # Calculer l'espace avant
+        import shutil
+        stat_before = shutil.disk_usage(models_dir)
+        
+        # Identifier le modèle actuel
+        current_model_name = os.path.basename(MODEL_PATH)
+        
+        cleaned_models = []
+        space_freed = 0
+        errors = []
+        
+        for model_file in all_models:
+            model_name = os.path.basename(model_file)
+            
+            # Garder le modèle actuel si demandé
+            if keep_current and model_name == current_model_name:
+                continue
+            
+            try:
+                file_size = os.path.getsize(model_file)
+                os.remove(model_file)
+                cleaned_models.append({
+                    "name": model_name,
+                    "size_gb": file_size / (1024**3)
+                })
+                space_freed += file_size
+            except Exception as e:
+                errors.append({
+                    "model": model_name,
+                    "error": str(e)
+                })
+        
+        # Calculer l'espace après
+        stat_after = shutil.disk_usage(models_dir)
+        
+        return {
+            "status": "success",
+            "cleaned_models": cleaned_models,
+            "space_freed_gb": space_freed / (1024**3),
+            "disk_usage": {
+                "before": {
+                    "free_gb": stat_before.free / (1024**3),
+                    "used_gb": stat_before.used / (1024**3),
+                    "total_gb": stat_before.total / (1024**3)
+                },
+                "after": {
+                    "free_gb": stat_after.free / (1024**3),
+                    "used_gb": stat_after.used / (1024**3),
+                    "total_gb": stat_after.total / (1024**3)
+                }
+            },
+            "errors": errors if errors else None
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/v1/disk-usage")
+async def disk_usage():
+    """Vérifie l'utilisation du disque"""
+    try:
+        import shutil
+        
+        # Espace disque général
+        stat = shutil.disk_usage("/")
+        workspace_stat = shutil.disk_usage("/workspace")
+        
+        # Lister les modèles
+        import glob
+        models = []
+        models_dir = "/workspace/models"
+        
+        if os.path.exists(models_dir):
+            for model_file in glob.glob(os.path.join(models_dir, "*.gguf")):
+                try:
+                    size = os.path.getsize(model_file)
+                    models.append({
+                        "name": os.path.basename(model_file),
+                        "size_gb": size / (1024**3),
+                        "size_bytes": size
+                    })
+                except:
+                    pass
+        
+        models.sort(key=lambda x: x['size_bytes'], reverse=True)
+        
+        return {
+            "root_disk": {
+                "free_gb": stat.free / (1024**3),
+                "used_gb": stat.used / (1024**3),
+                "total_gb": stat.total / (1024**3),
+                "usage_percent": (stat.used / stat.total) * 100
+            },
+            "workspace_disk": {
+                "free_gb": workspace_stat.free / (1024**3),
+                "used_gb": workspace_stat.used / (1024**3),
+                "total_gb": workspace_stat.total / (1024**3),
+                "usage_percent": (workspace_stat.used / workspace_stat.total) * 100
+            },
+            "models": models,
+            "total_models_size_gb": sum(m['size_gb'] for m in models),
+            "required_for_new_model_gb": 34,  # Qwen2.5-32B Q8_0
+            "can_download_new_model": workspace_stat.free / (1024**3) > 40
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/models", dependencies=[Depends(verify_token)])
 async def list_models():
@@ -840,12 +1035,12 @@ async def list_models():
             "object": "list",
             "data": [
                 {
-                    "id": "mixtral-8x7b",
+                    "id": "qwen2.5-32b",
                     "object": "model",
                     "created": int(time.time()),
-                    "owned_by": "Mistral AI",
+                    "owned_by": "Qwen Team",
                     "permission": [],
-                    "root": "mixtral-8x7b",
+                    "root": "qwen2.5-32b",
                     "parent": None,
                     "ready": llm is not None
                 }
@@ -868,35 +1063,29 @@ async def create_summary(request: dict):
     try:
         messages = request.get("messages", [])
         
-        extraction_prompt = f"""Analyse cette conversation médicale et extrais UNIQUEMENT les informations explicitement fournies.
-Retourne un JSON avec ces champs (null si non fourni) :
-
-{{
-  "nom": "valeur ou null",
-  "prenom": "valeur ou null", 
-  "dateNaissance": "format JJ/MM/AAAA ou null",
-  "dejaPatient": "oui/non/null",
-  "praticien": "Dr Nom ou null",
-  "motif": "description ou null",
-  "resume": "résumé court de la demande",
-  "categorie": "appointment_create/emergency/etc"
-}}
-
-Conversation à analyser:
-{chr(10).join([f"{m['role']}: {m['content']}" for m in messages])}
-
-Retourne UNIQUEMENT le JSON, sans texte avant ou après."""
-
+        # Convertir les messages en objets Message pour la validation
+        validated_messages = [Message(**msg) for msg in messages]
+        
+        # Utiliser le formatter Qwen pour construire le prompt
+        prompt = format_messages_qwen(validated_messages)
+        
+        # Log pour debug
+        logging.info(f"[SUMMARY] Extraction avec {len(validated_messages)} messages")
+        
         response = llm(
-            extraction_prompt,
+            prompt,
             max_tokens=500,
             temperature=0.1,
             top_p=0.9,
-            stop=["</s>", "[INST]", "[/INST]"]
+            stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
         )
         
         result_text = response['choices'][0]['text'].strip()
         parsed_result = smart_json_parse(result_text)
+        
+        # Si le parsing a échoué, on retourne quand même une structure
+        if "error" in parsed_result:
+            logging.warning(f"[SUMMARY] Parsing JSON échoué: {parsed_result['error']}")
         
         return {
             "status": "success",
@@ -927,7 +1116,6 @@ async def chat_completions(request: ChatCompletionRequest):
         logging.info(f"[CHAT] Messages reçus: {[(m.role, m.content[:50] + '...' if len(m.content) > 50 else m.content) for m in request.messages]}")
         
         # Déterminer le format à utiliser
-        # Si le premier message est un prompt système qui mentionne JSON ou si response_format demande JSON
         needs_json_format = False
         if request.response_format and request.response_format.get("type") == "json_object":
             needs_json_format = True
@@ -936,19 +1124,15 @@ async def chat_completions(request: ChatCompletionRequest):
             if "json" in system_content or "extraction" in system_content:
                 needs_json_format = True
         
-        # Utiliser le bon formatteur
-        if needs_json_format:
-            prompt = format_messages_mistral(request.messages)
-        else:
-            # Pour les conversations naturelles
-            prompt = format_messages_mistral_conversational(request.messages)
+        # Toujours utiliser le formatteur Qwen
+        prompt = format_messages_qwen(request.messages)
         
         # Ajouter le schema JSON si fourni
         if request.json_schema:
             schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(request.json_schema, indent=2)}"
             prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
         
-        logging.info(f"[CHAT] Format utilisé: {'JSON' if needs_json_format else 'Conversational'}")
+        logging.info(f"[CHAT] Format utilisé: Qwen ChatML")
         logging.debug(f"[CHAT] Prompt final (200 premiers chars): {prompt[:200]}...")
         
         inference_start = time.time()
@@ -958,8 +1142,8 @@ async def chat_completions(request: ChatCompletionRequest):
             max_tokens=request.max_tokens or 4096,
             temperature=request.temperature or 0.1,
             top_p=request.top_p or 0.9,
-            top_k=40,
-            stop=request.stop or ["</s>", "[INST]", "[/INST]"],
+            top_k=request.top_k or 40,
+            stop=request.stop or ["<|im_end|>", "<|im_start|>", "<|endoftext|>"],
             echo=False,
             repeat_penalty=1.1
         )
@@ -967,7 +1151,7 @@ async def chat_completions(request: ChatCompletionRequest):
         await inference_queue.get()
         
         inference_duration = time.time() - inference_start
-        fastapi_inference_duration_seconds.labels(model="mixtral-8x7b").observe(inference_duration)
+        fastapi_inference_duration_seconds.labels(model="qwen2.5-32b").observe(inference_duration)
         
         prompt_tokens = response['usage']['prompt_tokens']
         completion_tokens = response['usage']['completion_tokens']
@@ -1009,7 +1193,7 @@ async def chat_completions(request: ChatCompletionRequest):
             )
         )
         
-        fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="success").inc()
+        fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="success").inc()
         return chat_response
         
     except HTTPException:
@@ -1017,7 +1201,7 @@ async def chat_completions(request: ChatCompletionRequest):
         raise
     except Exception as e:
         status = "error"
-        fastapi_inference_requests_total.labels(model="mixtral-8x7b", status="error").inc()
+        fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="error").inc()
         logging.error(f"Erreur lors de la génération: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
@@ -1032,7 +1216,7 @@ async def warmup():
     
     try:
         # Faire une petite inférence pour warmup
-        warmup_prompt = "<s>[INST] Bonjour [/INST]"
+        warmup_prompt = "<|im_start|>user\nBonjour<|im_end|>\n<|im_start|>assistant\n"
         
         start_time = time.time()
         response = llm(
@@ -1058,18 +1242,8 @@ async def warmup():
 async def debug_prompt(request: ChatCompletionRequest):
     """Endpoint de debug pour voir le prompt généré sans appeler le modèle"""
     try:
-        # Déterminer le format
-        needs_json_format = False
-        if request.response_format and request.response_format.get("type") == "json_object":
-            needs_json_format = True
-        elif request.messages and request.messages[0].role == "system":
-            system_content = request.messages[0].content.lower()
-            if "json" in system_content or "extraction" in system_content:
-                needs_json_format = True
-        
-        # Générer les deux formats
-        prompt_conversational = format_messages_mistral_conversational(request.messages)
-        prompt_json = format_messages_mistral(request.messages)
+        # Générer le prompt Qwen
+        prompt_qwen = format_messages_qwen(request.messages)
         
         return {
             "messages_received": [
@@ -1078,14 +1252,13 @@ async def debug_prompt(request: ChatCompletionRequest):
                     "content": m.content[:100] + "..." if len(m.content) > 100 else m.content
                 } for m in request.messages
             ],
-            "detected_format": "json" if needs_json_format else "conversational",
-            "prompt_conversational": prompt_conversational[:500] + "..." if len(prompt_conversational) > 500 else prompt_conversational,
-            "prompt_json": prompt_json[:500] + "..." if len(prompt_json) > 500 else prompt_json,
-            "prompt_used": (prompt_json if needs_json_format else prompt_conversational)[:500] + "...",
+            "format": "ChatML (Qwen)",
+            "prompt": prompt_qwen[:500] + "..." if len(prompt_qwen) > 500 else prompt_qwen,
             "model_config": {
                 "temperature": request.temperature or 0.1,
                 "max_tokens": request.max_tokens or 4096,
-                "top_p": request.top_p or 0.9
+                "top_p": request.top_p or 0.9,
+                "top_k": request.top_k or 40
             }
         }
     except Exception as e:
@@ -1104,13 +1277,14 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     welcome_msg = {
         "type": "connection",
         "status": "connected",
-        "model": "mixtral-8x7b",
+        "model": "qwen2.5-32b",
         "model_loaded": llm is not None,
         "capabilities": [
             "French medical conversations",
             "Streaming responses",
-            "32K context",
-            "Async stream cancellation"  # NOUVEAU
+            "2K context window",
+            "Async stream cancellation",
+            "Better instruction following"
         ]
     }
     await websocket.send_json(welcome_msg)
@@ -1143,15 +1317,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 # Log pour debug
                 logging.info(f"[WS] Nouveau stream {request_id}: {[(m.role, len(m.content)) for m in messages]}")
                 
-                # Utiliser le formatteur conversationnel par défaut pour WebSocket
-                use_json_format = data.get("format") == "json"
+                # Toujours utiliser le formatteur Qwen
+                prompt = format_messages_qwen(messages)
                 
-                if use_json_format:
-                    prompt = format_messages_mistral(messages)
-                else:
-                    prompt = format_messages_mistral_conversational(messages)
-                
-                logging.info(f"[WS] Format utilisé: {'JSON' if use_json_format else 'Conversational'}")
+                logging.info(f"[WS] Format utilisé: Qwen ChatML")
                 
                 await websocket.send_json({
                     "type": "stream_start",
@@ -1171,9 +1340,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                         prompt,
                         request_id,
                         max_tokens=data.get("max_tokens", 200),
-                        temperature=data.get("temperature", 0.7),
+                        temperature=data.get("temperature", 0.1),
                         top_p=data.get("top_p", 0.9),
-                        stop=["</s>", "[INST]", "[/INST]"]
+                        top_k=data.get("top_k", 40),
+                        stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
                     ):
                         token = output['choices'][0]['text']
                         full_response += token
@@ -1210,31 +1380,42 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 # Le stream a été interrompu si on n'a pas atteint max_tokens
                 was_cancelled = cancelled or (tokens_count < data.get("max_tokens", 200) - 10)
                 
-                await websocket.send_json({
-                    "type": "stream_end",
-                    "full_response": full_response,
-                    "tokens": tokens_count,
-                    "request_id": request_id,
-                    "cancelled": was_cancelled,
-                    "duration": duration,
-                    "tokens_per_second": tps if duration > 0 else 0,
-                    "time_since_last_token": time.time() - last_token_time
-                })
+                # Vérifier que la connexion est toujours active avant d'envoyer la fin
+                if websocket.client_state.value == 1:  # 1 = CONNECTED
+                    try:
+                        await websocket.send_json({
+                            "type": "stream_end",
+                            "full_response": full_response,
+                            "tokens": tokens_count,
+                            "request_id": request_id,
+                            "cancelled": was_cancelled,
+                            "duration": duration,
+                            "tokens_per_second": tps if duration > 0 else 0,
+                            "time_since_last_token": time.time() - last_token_time
+                        })
+                    except Exception as e:
+                        logging.warning(f"[WS] Impossible d'envoyer stream_end: {e}")
+                else:
+                    logging.info(f"[WS] Client déconnecté, skip stream_end")
                 
                 logging.info(f"[WS] Stream {request_id} terminé: {tokens_count} tokens en {duration:.2f}s (annulé: {was_cancelled})")
                 
                 fastapi_inference_requests_total.labels(
-                    model="mixtral-8x7b", 
+                    model="qwen2.5-32b", 
                     status="cancelled" if was_cancelled else "success"
                 ).inc()
                 
             except Exception as e:
                 logging.error(f"[WS] Erreur: {str(e)}", exc_info=True)
-                await websocket.send_json({
-                    "type": "error",
-                    "error": str(e),
-                    "request_id": data.get("request_id")
-                })
+                if websocket.client_state.value == 1:
+                    try:
+                        await websocket.send_json({
+                            "type": "error",
+                            "error": str(e),
+                            "request_id": data.get("request_id")
+                        })
+                    except:
+                        pass  # Client déjà déconnecté
     
     except WebSocketDisconnect:
         logging.info("[WS] Client déconnecté")
