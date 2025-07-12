@@ -175,78 +175,77 @@ class StreamManager:
         return False
     
     async def generate_async(self, llm_model, prompt: str, request_id: str, **kwargs) -> AsyncGenerator[Dict, None]:
-        """Génère des tokens avec interruption par chunks"""
+        """Génère des tokens avec interruption immédiate via generation atomique"""
         cancel_event = self.register_stream(request_id)
         
-        # Réduire max_tokens si nécessaire pour permettre l'interruption
-        chunk_size = 50  # Générer par chunks de 50 tokens
         max_tokens = kwargs.get('max_tokens', 200)
-        kwargs['max_tokens'] = min(chunk_size, max_tokens)
+        temperature = kwargs.get('temperature', 0.7)
+        top_p = kwargs.get('top_p', 0.9)
+        stop = kwargs.get('stop', ["</s>", "[INST]", "[/INST]"])
         
         total_tokens = 0
         full_text = ""
+        prompt_with_context = prompt
         
         try:
             while total_tokens < max_tokens:
-                # Vérifier l'annulation avant chaque chunk
+                # Vérification immédiate de l'annulation
                 if cancel_event.is_set():
-                    logging.info(f"[STREAM] Interruption avant chunk pour {request_id}, {total_tokens} tokens générés")
+                    logging.info(f"[STREAM] Stream {request_id} interrompu avant token {total_tokens + 1}")
                     break
                 
-                # Ajuster le nombre de tokens pour le dernier chunk
-                remaining = max_tokens - total_tokens
-                kwargs['max_tokens'] = min(chunk_size, remaining)
-                
-                # Générer un chunk
-                chunk_start = time.time()
+                # Générer exactement 1 token
                 response = llm_model(
-                    prompt + full_text,  # Continuer depuis le texte déjà généré
-                    stream=False,  # Pas de streaming pour ce chunk
-                    **kwargs
+                    prompt_with_context,
+                    max_tokens=1,  # UN SEUL TOKEN
+                    temperature=temperature,
+                    top_p=top_p,
+                    stop=[],  # Pas de stop pour les tokens individuels
+                    echo=False,
+                    stream=False
                 )
-                chunk_time = time.time() - chunk_start
                 
-                # Extraire le nouveau texte (sans le prompt)
-                generated = response['choices'][0]['text']
-                if full_text:
-                    # Retirer la partie déjà générée
-                    new_text = generated[len(full_text):]
-                else:
-                    new_text = generated
-                
-                # Émettre token par token pour simuler le streaming
-                for char in new_text:
-                    if cancel_event.is_set():
-                        logging.info(f"[STREAM] Interruption pendant émission pour {request_id}")
-                        return
-                    
-                    total_tokens += 1
-                    self.update_token_count(request_id, total_tokens)
-                    
-                    # Simuler la structure de sortie de llama-cpp
-                    yield {
-                        'choices': [{
-                            'text': char,
-                            'finish_reason': None if total_tokens < max_tokens else 'length'
-                        }]
-                    }
-                    
-                    # Petit délai pour permettre l'interruption
-                    await asyncio.sleep(0.001)
-                
-                full_text += new_text
-                
-                # Si le modèle a fini naturellement
-                if response['choices'][0].get('finish_reason') == 'stop':
+                # Extraire le token généré
+                token = response['choices'][0]['text']
+                if not token:  # Fin naturelle
                     break
-                    
-                logging.debug(f"[STREAM] Chunk généré pour {request_id}: {len(new_text)} chars en {chunk_time:.2f}s")
+                
+                # Vérifier si c'est un token de stop
+                full_text += token
+                should_stop = False
+                for stop_seq in stop:
+                    if full_text.endswith(stop_seq):
+                        should_stop = True
+                        # Retirer la séquence de stop du texte final
+                        token = token[:-len(stop_seq)] if token.endswith(stop_seq) else token
+                        break
+                
+                # Émettre le token
+                total_tokens += 1
+                self.update_token_count(request_id, total_tokens)
+                
+                yield {
+                    'choices': [{
+                        'text': token,
+                        'finish_reason': 'stop' if should_stop else None
+                    }]
+                }
+                
+                # Mettre à jour le prompt pour le prochain token
+                prompt_with_context += token
+                
+                if should_stop:
+                    break
+                
+                # Micro-pause pour permettre la vérification d'annulation
+                await asyncio.sleep(0)  # Yield control to event loop
                 
         except Exception as e:
             logging.error(f"[STREAM] Erreur dans generate_async: {str(e)}")
             raise
         finally:
             self.unregister_stream(request_id)
+            logging.info(f"[STREAM] Fin du stream {request_id}: {total_tokens} tokens générés")
 
 # Instance globale du gestionnaire de streams
 stream_manager = StreamManager()
