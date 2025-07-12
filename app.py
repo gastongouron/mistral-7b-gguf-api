@@ -132,7 +132,8 @@ class StreamManager:
             self.active_streams[request_id] = {
                 'cancel_event': cancel_event,
                 'start_time': time.time(),
-                'tokens_generated': 0
+                'tokens_generated': 0,
+                'cancelled_at': None
             }
         return cancel_event
     
@@ -141,11 +142,16 @@ class StreamManager:
         with self._lock:
             if request_id in self.active_streams:
                 cancel_time = time.time()
-                start_time = self.active_streams[request_id]['start_time']
-                self.active_streams[request_id]['cancel_event'].set()
+                stream_info = self.active_streams[request_id]
+                stream_info['cancel_event'].set()
+                stream_info['cancelled_at'] = cancel_time
+                
+                # Métriques
+                start_time = stream_info['start_time']
                 stream_cancellation_total.inc()
                 stream_cancellation_latency_seconds.observe(cancel_time - start_time)
-                logging.info(f"[STREAM] Annulation demandée pour {request_id}")
+                
+                logging.info(f"[STREAM] Annulation demandée pour {request_id} après {stream_info['tokens_generated']} tokens")
                 return True
         return False
     
@@ -161,39 +167,95 @@ class StreamManager:
             if request_id in self.active_streams:
                 self.active_streams[request_id]['tokens_generated'] = count
     
+    def is_cancelled(self, request_id: str) -> bool:
+        """Vérifie si un stream est annulé"""
+        with self._lock:
+            if request_id in self.active_streams:
+                return self.active_streams[request_id]['cancel_event'].is_set()
+        return False
+    
     async def generate_async(self, llm_model, prompt: str, request_id: str, **kwargs) -> AsyncGenerator[Dict, None]:
         """Génère des tokens de manière asynchrone avec support d'interruption"""
         cancel_event = self.register_stream(request_id)
+        loop = asyncio.get_event_loop()
         
-        # Créer un générateur dans un thread séparé
-        def generate_with_cancellation():
+        # Queue pour passer les tokens entre threads
+        token_queue = asyncio.Queue(maxsize=10)
+        generation_complete = asyncio.Event()
+        generation_error = None
+        
+        def generate_in_thread():
+            """Fonction qui génère dans un thread séparé"""
+            nonlocal generation_error
             try:
                 stream = llm_model(prompt, stream=True, **kwargs)
                 tokens_count = 0
                 
                 for output in stream:
-                    # Vérifier l'interruption à chaque token
+                    # Vérifier l'interruption immédiatement
                     if cancel_event.is_set():
                         logging.info(f"[STREAM] Interruption détectée pour {request_id} après {tokens_count} tokens")
                         break
                     
                     tokens_count += 1
                     self.update_token_count(request_id, tokens_count)
-                    yield output
+                    
+                    # Envoyer le token à la queue de manière non-bloquante
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            token_queue.put(output), 
+                            loop
+                        ).result(timeout=0.1)
+                    except:
+                        # Si la queue est pleine ou timeout, vérifier l'annulation
+                        if cancel_event.is_set():
+                            break
                     
             except Exception as e:
+                generation_error = e
                 logging.error(f"[STREAM] Erreur dans la génération: {str(e)}")
-                raise
             finally:
+                # Signaler la fin
+                asyncio.run_coroutine_threadsafe(
+                    generation_complete.set(), 
+                    loop
+                )
                 self.unregister_stream(request_id)
         
-        # Convertir le générateur synchrone en asynchrone
-        loop = asyncio.get_event_loop()
+        # Lancer la génération dans un thread
+        generation_future = self.executor.submit(generate_in_thread)
         
-        for output in generate_with_cancellation():
-            # Permettre à asyncio de traiter d'autres tâches
-            await asyncio.sleep(0)
-            yield output
+        try:
+            # Consommer les tokens de la queue
+            while not generation_complete.is_set() or not token_queue.empty():
+                try:
+                    # Timeout court pour vérifier régulièrement l'état
+                    output = await asyncio.wait_for(token_queue.get(), timeout=0.1)
+                    yield output
+                except asyncio.TimeoutError:
+                    # Vérifier si on doit arrêter
+                    if cancel_event.is_set():
+                        logging.info(f"[STREAM] Arrêt du consumer pour {request_id}")
+                        break
+                    continue
+            
+            # Vérifier s'il y a eu une erreur
+            if generation_error:
+                raise generation_error
+                
+        finally:
+            # S'assurer que le thread s'arrête
+            cancel_event.set()
+            # Attendre max 1 seconde que le thread se termine
+            try:
+                await asyncio.wait_for(
+                    loop.run_in_executor(None, generation_future.result), 
+                    timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                logging.warning(f"[STREAM] Timeout en attendant la fin du thread pour {request_id}")
+            except Exception as e:
+                logging.error(f"[STREAM] Erreur lors de l'arrêt du thread: {e}")
 
 # Instance globale du gestionnaire de streams
 stream_manager = StreamManager()
@@ -1121,25 +1183,36 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 full_response = ""
                 tokens_count = 0
                 start_time = time.time()
+                last_token_time = start_time
+                cancelled = False
                 
-                async for output in stream_manager.generate_async(
-                    llm,
-                    prompt,
-                    request_id,
-                    max_tokens=data.get("max_tokens", 200),
-                    temperature=data.get("temperature", 0.7),
-                    top_p=data.get("top_p", 0.9),
-                    stop=["</s>", "[INST]", "[/INST]"]
-                ):
-                    token = output['choices'][0]['text']
-                    full_response += token
-                    tokens_count += 1
-                    
-                    await websocket.send_json({
-                        "type": "stream_token",
-                        "token": token,
-                        "request_id": request_id
-                    })
+                try:
+                    async for output in stream_manager.generate_async(
+                        llm,
+                        prompt,
+                        request_id,
+                        max_tokens=data.get("max_tokens", 200),
+                        temperature=data.get("temperature", 0.7),
+                        top_p=data.get("top_p", 0.9),
+                        stop=["</s>", "[INST]", "[/INST]"]
+                    ):
+                        token = output['choices'][0]['text']
+                        full_response += token
+                        tokens_count += 1
+                        last_token_time = time.time()
+                        
+                        await websocket.send_json({
+                            "type": "stream_token",
+                            "token": token,
+                            "request_id": request_id
+                        })
+                        
+                        # Petit délai pour permettre la réception de cancel_stream
+                        await asyncio.sleep(0.001)
+                        
+                except asyncio.CancelledError:
+                    cancelled = True
+                    logging.info(f"[WS] Stream {request_id} annulé après {tokens_count} tokens")
                 
                 # Calculer les métriques
                 duration = time.time() - start_time
@@ -1147,8 +1220,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     tps = tokens_count / duration
                     fastapi_inference_tokens_per_second.set(tps)
                 
-                # Vérifier si le stream a été interrompu
-                was_cancelled = request_id not in stream_manager.active_streams
+                # Le stream a été interrompu si on n'a pas atteint max_tokens
+                was_cancelled = cancelled or (tokens_count < data.get("max_tokens", 200) - 10)
                 
                 await websocket.send_json({
                     "type": "stream_end",
@@ -1157,7 +1230,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                     "request_id": request_id,
                     "cancelled": was_cancelled,
                     "duration": duration,
-                    "tokens_per_second": tps if duration > 0 else 0
+                    "tokens_per_second": tps if duration > 0 else 0,
+                    "time_since_last_token": time.time() - last_token_time
                 })
                 
                 logging.info(f"[WS] Stream {request_id} terminé: {tokens_count} tokens en {duration:.2f}s (annulé: {was_cancelled})")
