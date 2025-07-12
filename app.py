@@ -31,8 +31,9 @@ import weakref
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
 
 # Configuration pour Qwen2.5-32B
-MODEL_PATH = "/workspace/models/qwen2_5-32b-instruct-q4_k_m.gguf"
-MODEL_URL = "https://huggingface.co/Qwen/Qwen2.5-32B-Instruct-GGUF/resolve/main/qwen2_5-32b-instruct-q4_k_m.gguf"
+MODEL_PATH = "/workspace/models/Qwen2.5-72B-Instruct-Q3_K_M.gguf"
+MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-72B-Instruct-GGUF/resolve/main/Qwen2.5-72B-Instruct-Q3_K_M.gguf"
+
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
 
 # Configuration du logging
@@ -660,8 +661,8 @@ def load_model():
     
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=8192,  # Contexte réduit pour meilleures performances
-        n_threads=12,
+        n_ctx=4096,  # Contexte réduit pour meilleures performances
+        n_threads=16,
         n_gpu_layers=n_gpu_layers,
         n_batch=512,
         use_mmap=True,
