@@ -38,20 +38,36 @@ RUN mkdir -p /workspace/models
 # Copier l'application
 COPY app.py /app/
 
+# Script de nettoyage
+RUN echo '#!/bin/bash\n\
+echo "🧹 Nettoyage des anciens modèles..."\n\
+if [ -d "/workspace/models" ]; then\n\
+    echo "📊 Contenu actuel du dossier models:"\n\
+    ls -lah /workspace/models/\n\
+    echo ""\n\
+    # Supprimer tous les fichiers .gguf sauf Qwen2.5-72B\n\
+    find /workspace/models -name "*.gguf" ! -name "*Qwen2.5-72B*" -type f -exec rm -v {} \;\n\
+    echo ""\n\
+    echo "💾 Espace disque après nettoyage:"\n\
+    df -h /workspace\n\
+fi\n\
+echo "✅ Nettoyage terminé"\n\
+echo ""' > /app/cleanup.sh && chmod +x /app/cleanup.sh
+
 # Informations sur l'image
 RUN echo "=== Docker image build completed ===" && \
-    echo "Model: Qwen2.5-32B-Instruct will be downloaded on first start" && \
-    echo "Download size: ~18.5 GB (Q4_K_M quantization)" && \
+    echo "Model: Qwen2.5-72B-Instruct-Q3_K_M will be downloaded on first start" && \
+    echo "Download size: ~40 GB (Q3_K_M quantization)" && \
     echo "API will be available on port 8000 after model download" && \
     echo "Metrics available at /metrics endpoint" && \
-    echo "Better instruction following than Mixtral!"
+    echo "Auto-cleanup of old models enabled!"
 
 # Exposer le port
 EXPOSE 8000
 
-# Commande de démarrage
-CMD echo "Starting Qwen2.5-32B API server..." && \
-    echo "Note: Model will be downloaded on first start (~18.5 GB)" && \
-    echo "This may take 10-20 minutes depending on connection speed" && \
-    echo "Qwen offers better instruction following than Mixtral for conversational AI" && \
+# Commande de démarrage avec nettoyage
+CMD echo "Starting Qwen2.5-72B API server..." && \
+    /app/cleanup.sh && \
+    echo "Note: Model will be downloaded on first start (~40 GB)" && \
+    echo "This may take 15-30 minutes depending on connection speed" && \
     uvicorn app:app --host 0.0.0.0 --port 8000

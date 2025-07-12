@@ -545,19 +545,74 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
             print("   export HF_TOKEN='votre_token_huggingface'")
         return False
 
+def cleanup_old_models():
+    """Nettoie les anciens modèles GGUF avant de télécharger le nouveau"""
+    models_dir = "/workspace/models"
+    
+    print(f"\n{'='*60}")
+    print("🧹 NETTOYAGE DES ANCIENS MODÈLES")
+    print(f"{'='*60}")
+    
+    try:
+        # Lister tous les fichiers GGUF
+        import glob
+        old_models = glob.glob(os.path.join(models_dir, "*.gguf"))
+        
+        if not old_models:
+            print("✅ Aucun ancien modèle trouvé")
+            return
+        
+        # Calculer l'espace utilisé
+        total_size = sum(os.path.getsize(f) for f in old_models)
+        print(f"📊 Espace utilisé par les anciens modèles: {total_size / (1024**3):.1f} GB")
+        
+        # Supprimer les anciens modèles SAUF celui qu'on veut télécharger
+        target_model = os.path.basename(MODEL_PATH)
+        for model_file in old_models:
+            if os.path.basename(model_file) != target_model:
+                print(f"🗑️  Suppression de: {os.path.basename(model_file)}")
+                try:
+                    os.remove(model_file)
+                    print(f"   ✅ Supprimé")
+                except Exception as e:
+                    print(f"   ❌ Erreur: {e}")
+        
+        # Vérifier l'espace libre après nettoyage
+        import shutil
+        stat = shutil.disk_usage(models_dir)
+        free_gb = stat.free / (1024**3)
+        print(f"\n💾 Espace libre après nettoyage: {free_gb:.1f} GB")
+        
+        # Vérifier si on a assez d'espace pour le nouveau modèle (Q3_K_M ~40GB)
+        required_gb = 45  # 40GB pour le modèle + marge
+        if free_gb < required_gb:
+            print(f"⚠️  ATTENTION: Seulement {free_gb:.1f} GB disponibles")
+            print(f"   Le modèle Qwen2.5-72B-Q3_K_M nécessite ~40 GB")
+            print(f"   Il faudrait libérer encore {required_gb - free_gb:.1f} GB")
+        else:
+            print(f"✅ Espace suffisant pour télécharger le nouveau modèle")
+            
+    except Exception as e:
+        print(f"❌ Erreur lors du nettoyage: {e}")
+        
+    print(f"{'='*60}\n")
+
 def download_model_if_needed():
     """Télécharger le modèle au premier démarrage si nécessaire"""
     global download_in_progress, download_complete
     
+    # NETTOYER LES ANCIENS MODÈLES D'ABORD
+    cleanup_old_models()
+    
     if os.path.exists(MODEL_PATH):
         file_size = os.path.getsize(MODEL_PATH)
-        expected_size = 18_500_000_000  # ~18.5 GB pour Q4_K_M
+        expected_size = 40_000_000_000  # ~40 GB pour Q3_K_M
         if file_size > expected_size * 0.95:  # 95% de la taille attendue
             print(f"✅ Modèle trouvé: {file_size / (1024**3):.1f} GB")
             download_complete = True
             return
         else:
-            print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")
+            print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")    
     
     if download_in_progress:
         print("⏳ Téléchargement déjà en cours...")
