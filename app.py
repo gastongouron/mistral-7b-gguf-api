@@ -685,12 +685,12 @@ def download_model_if_needed():
         download_in_progress = False
 
 def load_model():
-    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-32B"""
+    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-72B"""
     global llm
     
     download_model_if_needed()
     
-    print(f"Chargement du modèle Qwen2.5-32B depuis {MODEL_PATH}...")
+    print(f"Chargement du modèle Qwen2.5-72B depuis {MODEL_PATH}...")
     
     try:
         import pynvml
@@ -698,40 +698,88 @@ def load_model():
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         vram_gb = mem_info.total / (1024**3)
-        print(f"VRAM disponible: {vram_gb:.1f} GB")
+        vram_free_gb = mem_info.free / (1024**3)
         
-        # Qwen2.5-32B Q4_K_M nécessite environ 20-25GB VRAM
-        if vram_gb >= 48:  # L40 ou mieux
-            n_gpu_layers = -1
-            print("Configuration: Modèle entièrement sur GPU (optimal)")
-        elif vram_gb >= 24:
-            n_gpu_layers = 40  # La plupart des couches
-            print("Configuration: 40 couches sur GPU")
+        print(f"VRAM totale: {vram_gb:.1f} GB")
+        print(f"VRAM libre: {vram_free_gb:.1f} GB")
+        
+        # Qwen2.5-72B Q3_K_M nécessite environ 40GB VRAM
+        if vram_gb >= 80:  # A100 80GB ou H100
+            n_gpu_layers = -1  # Tout sur GPU
+            print("Configuration: Modèle ENTIÈREMENT sur GPU (optimal)")
+        elif vram_gb >= 48:  # L40 48GB
+            # Q3_K_M ~40GB, on peut mettre la plupart sur GPU
+            n_gpu_layers = 60  # Environ 75% des couches
+            print(f"Configuration: {n_gpu_layers} couches sur GPU (L40 détecté)")
+        elif vram_gb >= 40:
+            n_gpu_layers = 50
+            print(f"Configuration: {n_gpu_layers} couches sur GPU")
         else:
-            n_gpu_layers = 20
-            print(f"⚠️ VRAM limitée ({vram_gb:.1f}GB), performance réduite")
+            # ALERTE : Pas assez de VRAM !
+            print("="*60)
+            print("⚠️  ALERTE PERFORMANCE ⚠️")
+            print(f"VRAM insuffisante: {vram_gb:.1f}GB")
+            print("Qwen2.5-72B Q3_K_M nécessite 40GB+ de VRAM")
+            print("Le modèle sera TRÈS LENT sur CPU!")
+            print("="*60)
+            n_gpu_layers = int(vram_gb * 1.2)  # Essayer de mettre ce qu'on peut
+            
     except Exception as e:
-        n_gpu_layers = -1
-        print(f"Impossible de détecter la VRAM ({e}), tentative de chargement complet sur GPU")
+        print(f"⚠️ Impossible de détecter la VRAM: {e}")
+        n_gpu_layers = -1  # Tenter quand même
+    
+    # Calculer le nombre de couches du modèle
+    # Qwen2.5-72B a 80 couches
+    total_layers = 80
+    
+    print(f"\nConfiguration finale:")
+    print(f"- Modèle: Qwen2.5-72B Q3_K_M")
+    print(f"- Couches totales: {total_layers}")
+    print(f"- Couches sur GPU: {n_gpu_layers if n_gpu_layers != -1 else 'TOUTES'}")
+    print(f"- Couches sur CPU: {0 if n_gpu_layers == -1 else max(0, total_layers - n_gpu_layers)}")
+    
+    start_load = time.time()
     
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=4096,  # Contexte réduit pour meilleures performances
-        n_threads=16,
+        n_ctx=2048,  # Contexte réduit pour performance
+        n_threads=8,  # Moins de threads pour éviter la contention
         n_gpu_layers=n_gpu_layers,
-        n_batch=512,
+        n_batch=256,  # Batch réduit pour latence
         use_mmap=True,
-        use_mlock=False,
+        use_mlock=True,  # Verrouiller en RAM
         verbose=True,
         seed=42,
-        # Paramètres spécifiques à Qwen
-        rope_freq_base=1000000,  # Important pour Qwen
-        rope_freq_scale=1.0
+        # Paramètres Qwen
+        rope_freq_base=1000000,
+        rope_freq_scale=1.0,
+        # Optimisations supplémentaires
+        f16_kv=True,  # Cache en float16
+        logits_all=False,
+        vocab_only=False
     )
     
-    print("Modèle Qwen2.5-32B chargé avec succès!")
-    print(f"Configuration: {n_gpu_layers} couches GPU, contexte 8K tokens")
-
+    load_time = time.time() - start_load
+    print(f"\n✅ Modèle chargé en {load_time:.1f} secondes")
+    
+    # Test de génération rapide
+    print("\n🧪 Test de performance...")
+    test_start = time.time()
+    test_prompt = "<|im_start|>user\nBonjour<|im_end|>\n<|im_start|>assistant\n"
+    
+    result = llm(test_prompt, max_tokens=10, temperature=0.1)
+    test_time = time.time() - test_start
+    
+    print(f"⏱️ Temps pour 10 tokens: {test_time:.2f}s")
+    print(f"📊 Vitesse: {10/test_time:.1f} tokens/seconde")
+    
+    if test_time > 2:
+        print("\n⚠️ ALERTE: Le modèle est trop lent!")
+        print("   Première réponse prendra plus de 5 secondes")
+        print("   Considérez une quantization plus légère ou plus de VRAM")
+    
+    return llm
+    
 # ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
