@@ -175,87 +175,78 @@ class StreamManager:
         return False
     
     async def generate_async(self, llm_model, prompt: str, request_id: str, **kwargs) -> AsyncGenerator[Dict, None]:
-        """Génère des tokens de manière asynchrone avec support d'interruption"""
+        """Génère des tokens avec interruption par chunks"""
         cancel_event = self.register_stream(request_id)
-        loop = asyncio.get_event_loop()
         
-        # Queue pour passer les tokens entre threads
-        token_queue = asyncio.Queue(maxsize=10)
-        generation_complete = asyncio.Event()
-        generation_error = None
+        # Réduire max_tokens si nécessaire pour permettre l'interruption
+        chunk_size = 50  # Générer par chunks de 50 tokens
+        max_tokens = kwargs.get('max_tokens', 200)
+        kwargs['max_tokens'] = min(chunk_size, max_tokens)
         
-        def generate_in_thread():
-            """Fonction qui génère dans un thread séparé"""
-            nonlocal generation_error
-            try:
-                stream = llm_model(prompt, stream=True, **kwargs)
-                tokens_count = 0
-                
-                for output in stream:
-                    # Vérifier l'interruption immédiatement
-                    if cancel_event.is_set():
-                        logging.info(f"[STREAM] Interruption détectée pour {request_id} après {tokens_count} tokens")
-                        break
-                    
-                    tokens_count += 1
-                    self.update_token_count(request_id, tokens_count)
-                    
-                    # Envoyer le token à la queue de manière non-bloquante
-                    try:
-                        asyncio.run_coroutine_threadsafe(
-                            token_queue.put(output), 
-                            loop
-                        ).result(timeout=0.1)
-                    except:
-                        # Si la queue est pleine ou timeout, vérifier l'annulation
-                        if cancel_event.is_set():
-                            break
-                    
-            except Exception as e:
-                generation_error = e
-                logging.error(f"[STREAM] Erreur dans la génération: {str(e)}")
-            finally:
-                # Signaler la fin
-                asyncio.run_coroutine_threadsafe(
-                    generation_complete.set(), 
-                    loop
-                )
-                self.unregister_stream(request_id)
-        
-        # Lancer la génération dans un thread
-        generation_future = self.executor.submit(generate_in_thread)
+        total_tokens = 0
+        full_text = ""
         
         try:
-            # Consommer les tokens de la queue
-            while not generation_complete.is_set() or not token_queue.empty():
-                try:
-                    # Timeout court pour vérifier régulièrement l'état
-                    output = await asyncio.wait_for(token_queue.get(), timeout=0.1)
-                    yield output
-                except asyncio.TimeoutError:
-                    # Vérifier si on doit arrêter
-                    if cancel_event.is_set():
-                        logging.info(f"[STREAM] Arrêt du consumer pour {request_id}")
-                        break
-                    continue
-            
-            # Vérifier s'il y a eu une erreur
-            if generation_error:
-                raise generation_error
+            while total_tokens < max_tokens:
+                # Vérifier l'annulation avant chaque chunk
+                if cancel_event.is_set():
+                    logging.info(f"[STREAM] Interruption avant chunk pour {request_id}, {total_tokens} tokens générés")
+                    break
                 
-        finally:
-            # S'assurer que le thread s'arrête
-            cancel_event.set()
-            # Attendre max 1 seconde que le thread se termine
-            try:
-                await asyncio.wait_for(
-                    loop.run_in_executor(None, generation_future.result), 
-                    timeout=1.0
+                # Ajuster le nombre de tokens pour le dernier chunk
+                remaining = max_tokens - total_tokens
+                kwargs['max_tokens'] = min(chunk_size, remaining)
+                
+                # Générer un chunk
+                chunk_start = time.time()
+                response = llm_model(
+                    prompt + full_text,  # Continuer depuis le texte déjà généré
+                    stream=False,  # Pas de streaming pour ce chunk
+                    **kwargs
                 )
-            except asyncio.TimeoutError:
-                logging.warning(f"[STREAM] Timeout en attendant la fin du thread pour {request_id}")
-            except Exception as e:
-                logging.error(f"[STREAM] Erreur lors de l'arrêt du thread: {e}")
+                chunk_time = time.time() - chunk_start
+                
+                # Extraire le nouveau texte (sans le prompt)
+                generated = response['choices'][0]['text']
+                if full_text:
+                    # Retirer la partie déjà générée
+                    new_text = generated[len(full_text):]
+                else:
+                    new_text = generated
+                
+                # Émettre token par token pour simuler le streaming
+                for char in new_text:
+                    if cancel_event.is_set():
+                        logging.info(f"[STREAM] Interruption pendant émission pour {request_id}")
+                        return
+                    
+                    total_tokens += 1
+                    self.update_token_count(request_id, total_tokens)
+                    
+                    # Simuler la structure de sortie de llama-cpp
+                    yield {
+                        'choices': [{
+                            'text': char,
+                            'finish_reason': None if total_tokens < max_tokens else 'length'
+                        }]
+                    }
+                    
+                    # Petit délai pour permettre l'interruption
+                    await asyncio.sleep(0.001)
+                
+                full_text += new_text
+                
+                # Si le modèle a fini naturellement
+                if response['choices'][0].get('finish_reason') == 'stop':
+                    break
+                    
+                logging.debug(f"[STREAM] Chunk généré pour {request_id}: {len(new_text)} chars en {chunk_time:.2f}s")
+                
+        except Exception as e:
+            logging.error(f"[STREAM] Erreur dans generate_async: {str(e)}")
+            raise
+        finally:
+            self.unregister_stream(request_id)
 
 # Instance globale du gestionnaire de streams
 stream_manager = StreamManager()
@@ -1201,14 +1192,22 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                         tokens_count += 1
                         last_token_time = time.time()
                         
-                        await websocket.send_json({
-                            "type": "stream_token",
-                            "token": token,
-                            "request_id": request_id
-                        })
+                        # Vérifier si la connexion est toujours ouverte
+                        if websocket.client_state.value != 1:  # 1 = CONNECTED
+                            logging.info(f"[WS] Client déconnecté pendant stream {request_id}")
+                            cancelled = True
+                            break
                         
-                        # Petit délai pour permettre la réception de cancel_stream
-                        await asyncio.sleep(0.001)
+                        try:
+                            await websocket.send_json({
+                                "type": "stream_token",
+                                "token": token,
+                                "request_id": request_id
+                            })
+                        except Exception as e:
+                            logging.info(f"[WS] Erreur envoi token: {e}")
+                            cancelled = True
+                            break
                         
                 except asyncio.CancelledError:
                     cancelled = True
