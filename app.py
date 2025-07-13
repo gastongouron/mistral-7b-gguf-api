@@ -1,7 +1,7 @@
 """
 API FastAPI pour servir le modèle Qwen2.5-32B GGUF avec llama-cpp-python
 Optimisé pour conversations médicales françaises avec streaming et interruption
-Version 7.0.0 - Qwen Edition
+Version 7.1.0 - Qwen Edition Optimisée
 """
 import os
 import time
@@ -42,13 +42,17 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 
+# Configuration VoxImplant
+VOXIMPLANT_FIN_MARKER = "##FIN_COLLECTE##"
+VOXIMPLANT_FIN_KEYWORDS = ["parfait", "j'ai toutes les informations nécessaires"]
+
 # ===== MÉTRIQUES PROMETHEUS =====
 system_info = Info('fastapi_system', 'System information')
 system_info.info({
     'model': 'qwen2.5-32b',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '7.0.0'  # Version Qwen
+    'version': '7.1.0'  # Version Qwen Optimisée
 })
 
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
@@ -91,7 +95,7 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = 0.1
     max_tokens: Optional[int] = 4096
     top_p: Optional[float] = 0.9
-    top_k: Optional[int] = None  # Ajout pour support top_k
+    top_k: Optional[int] = None
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
     response_format: Optional[Dict[str, str]] = None
@@ -117,6 +121,7 @@ class ChatCompletionResponse(BaseModel):
 
 # Variable globale pour le modèle
 llm = None
+n_ctx = 4096  # Valeur par défaut
 
 # ===== GESTIONNAIRE DE STREAMS INTERRUPTIBLES =====
 class StreamManager:
@@ -179,13 +184,11 @@ class StreamManager:
         """Génère des tokens avec interruption côté client uniquement"""
         cancel_event = self.register_stream(request_id)
         
-        # Utiliser la génération streaming normale de llama-cpp
-        # mais vérifier l'annulation à chaque token côté envoi
         loop = asyncio.get_event_loop()
         
         # Réduire max_tokens pour limiter la génération inutile
         original_max_tokens = kwargs.get('max_tokens', 200)
-        kwargs['max_tokens'] = min(original_max_tokens, 100)  # Limiter à 100 tokens par requête
+        kwargs['max_tokens'] = min(original_max_tokens, 100)
         
         def generate_sync():
             """Génération synchrone dans un thread"""
@@ -204,7 +207,6 @@ class StreamManager:
                 # Vérifier l'annulation AVANT d'envoyer
                 if cancel_event.is_set():
                     logging.info(f"[STREAM] Arrêt de l'envoi pour {request_id} après {tokens_generated} tokens")
-                    # On ne peut pas arrêter la génération, mais on arrête l'envoi
                     break
                 
                 tokens_generated += 1
@@ -294,17 +296,31 @@ async def metrics_update_task():
 
 # ===== FORMATTERS POUR QWEN =====
 def format_messages_qwen(messages: List[Message]) -> str:
-    """Format ChatML pour Qwen2.5"""
+    """Format ChatML pour Qwen2.5 avec renforcement des instructions"""
     prompt = ""
+    
+    # Identifier le dernier message système (le plus important)
+    system_content = None
+    for msg in messages:
+        if msg.role == "system":
+            system_content = msg.content
+    
+    # Si on a un système prompt, le mettre en premier avec emphase
+    if system_content:
+        prompt += f"<|im_start|>system\n{system_content}\n<|im_end|>\n"
+    
+    # Ensuite ajouter l'historique de conversation
     for message in messages:
         if message.role == "system":
-            prompt += f"<|im_start|>system\n{message.content}<|im_end|>\n"
+            continue  # Déjà traité
         elif message.role == "user":
             prompt += f"<|im_start|>user\n{message.content}<|im_end|>\n"
         elif message.role == "assistant":
             prompt += f"<|im_start|>assistant\n{message.content}<|im_end|>\n"
-    # Ajouter le début de la réponse assistant
+    
+    # Début de la réponse assistant
     prompt += "<|im_start|>assistant\n"
+    
     return prompt
 
 # ===== PARSING JSON AMÉLIORÉ =====
@@ -686,11 +702,13 @@ def download_model_if_needed():
 
 def load_model():
     """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-32B"""
-    global llm
+    global llm, n_ctx
     
     download_model_if_needed()
     
     print(f"Chargement du modèle Qwen2.5-32B Q8_0 depuis {MODEL_PATH}...")
+    
+    handle = None  # Pour le diagnostic VRAM après chargement
     
     try:
         import pynvml
@@ -708,11 +726,15 @@ def load_model():
             n_gpu_layers = -1  # Tout sur GPU
             print("Configuration: Modèle ENTIÈREMENT sur GPU (L40 détecté)")
         elif vram_gb >= 40:
-            n_gpu_layers = 55  # La plupart des couches
-            print(f"Configuration: {n_gpu_layers} couches sur GPU")
+            # CHANGEMENT ICI : Forcer tout sur GPU même avec 40-48GB
+            n_gpu_layers = -1  # TOUT sur GPU au lieu de 55
+            print("Configuration: Modèle ENTIÈREMENT sur GPU (40GB+ détecté)")
+            print("⚠️  Si OOM, réduire n_ctx à 2048")
         elif vram_gb >= 34:
-            n_gpu_layers = 50
-            print(f"Configuration: {n_gpu_layers} couches sur GPU")
+            # Essayer quand même tout sur GPU avec contexte réduit
+            n_gpu_layers = -1
+            print("Configuration: Tentative modèle ENTIER sur GPU")
+            print("⚠️  ATTENTION: Contexte sera réduit à 2048 pour économiser la VRAM")
         else:
             print("="*60)
             print("⚠️  ALERTE PERFORMANCE ⚠️")
@@ -721,10 +743,23 @@ def load_model():
             print("="*60)
             n_gpu_layers = int((vram_gb / 34) * 60)  # Proportionnel
             
+        # Ajuster n_ctx selon la VRAM disponible
+        if vram_gb >= 44:
+            n_ctx = 4096  # Contexte complet
+        elif vram_gb >= 40:
+            n_ctx = 3072  # Contexte réduit
+        elif vram_gb >= 36:
+            n_ctx = 2048  # Contexte minimal
+        else:
+            n_ctx = 1024  # Survie
+            
+        print(f"Contexte configuré: {n_ctx} tokens")
+            
     except Exception as e:
         print(f"⚠️ Impossible de détecter la VRAM: {e}")
         print("Tentative de chargement complet sur GPU quand même...")
-        n_gpu_layers = -1  # IMPORTANT : Tenter sur GPU même si détection échoue !
+        n_gpu_layers = -1  # Forcer GPU même si détection échoue
+        n_ctx = 2048  # Contexte sûr par défaut
     
     # Calculer le nombre de couches du modèle
     # Qwen2.5-32B a environ 60 couches
@@ -740,19 +775,19 @@ def load_model():
     
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=4096,  # Contexte raisonnable pour performance
-        n_threads=8,  # Threads CPU pour les parties sur CPU
-        n_gpu_layers=n_gpu_layers,  # UTILISER LE GPU !
-        n_batch=512,  # Batch optimal
+        n_ctx=n_ctx,  # Utiliser la valeur calculée
+        n_threads=8,
+        n_gpu_layers=n_gpu_layers,
+        n_batch=512,
         use_mmap=True,
-        use_mlock=False,  # False pour GPU
+        use_mlock=False,
         verbose=True,
         seed=42,
         # Paramètres Qwen
         rope_freq_base=1000000,
         rope_freq_scale=1.0,
         # Optimisations GPU
-        f16_kv=True,  # Float16 pour GPU
+        f16_kv=True,
         logits_all=False,
         vocab_only=False
     )
@@ -760,6 +795,20 @@ def load_model():
     load_time = time.time() - start_load
     print(f"\n✅ Modèle chargé en {load_time:.1f} secondes")
     model_loaded.set(1)
+    model_loading_duration_seconds.set(load_time)
+    
+    # NOUVEAU : Diagnostic VRAM après chargement
+    if handle:
+        try:
+            mem_info_after = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            vram_used_gb = mem_info_after.used / (1024**3)
+            vram_free_after_gb = mem_info_after.free / (1024**3)
+            print(f"\n📊 VRAM après chargement:")
+            print(f"   - Utilisée: {vram_used_gb:.1f} GB")
+            print(f"   - Libre: {vram_free_after_gb:.1f} GB")
+            print(f"   - Modèle occupe: {vram_used_gb - (vram_gb - vram_free_gb):.1f} GB")
+        except:
+            pass
     
     # Test de performance
     print("\n🧪 Test de performance...")
@@ -775,6 +824,7 @@ def load_model():
     if test_time > 2:
         print("\n⚠️ Performance limitée")
         print("   Vérifiez que le modèle est bien sur GPU")
+        print(f"   Couches GPU actuelles: {n_gpu_layers}")
     else:
         print("\n✅ Excellente performance GPU!")
     
@@ -813,7 +863,7 @@ async def lifespan(app: FastAPI):
 # ===== APPLICATION FASTAPI =====
 app = FastAPI(
     title="Qwen2.5-32B GGUF API",
-    version="7.0.0",
+    version="7.1.0",
     description="API FastAPI pour Qwen2.5-32B avec streaming et interruption asynchrone",
     lifespan=lifespan
 )
@@ -852,6 +902,7 @@ async def root():
             "Better instruction following than Mixtral"
         ],
         "active_streams": len(stream_manager.active_streams),
+        "context_size": n_ctx,
         "endpoints": {
             "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
             "/ws": "WebSocket - Streaming chat endpoint with interruption support (requires token in query)",
@@ -865,7 +916,6 @@ async def root():
         }
     }
 
-
 @app.get("/health")
 async def health_check():
     health_status = {
@@ -876,6 +926,7 @@ async def health_check():
         "download_complete": download_complete,
         "download_in_progress": download_in_progress,
         "active_streams": len(stream_manager.active_streams),
+        "context_size": n_ctx,
         "json_parse_stats": {
             "success": json_parse_success_total._value._value if hasattr(json_parse_success_total, '_value') else 0,
             "failure": json_parse_failure_total._value._value if hasattr(json_parse_failure_total, '_value') else 0
@@ -1263,7 +1314,7 @@ async def debug_prompt(request: ChatCompletionRequest):
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
+        
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     """Endpoint WebSocket avec streaming et interruption asynchrone"""

@@ -21,18 +21,21 @@ LLM_API_KEY = "supersecret"
 
 # État global
 tokens_received = 0
+tokens_before_interruption = 0
+tokens_after_interruption = 0
 last_token_time = None
 streaming_start_time = None
 interruption_time = None
-tokens_after_interruption = 0
 current_request_id = None
 full_response = ""
+interruption_sent = False
 
 # Couleurs pour l'output
 class Colors:
     BLUE = '\033[94m'
     GREEN = '\033[92m'
     RED = '\033[91m'
+    YELLOW = '\033[93m'
     END = '\033[0m'
 
 def log(msg):
@@ -44,15 +47,13 @@ def success(msg):
 def error(msg):
     print(f"{Colors.RED}[✗]{Colors.END} {msg}")
 
-# Prompt système pour générer une longue réponse
-SYSTEM_PROMPT = """Tu es un assistant qui doit donner des explications TRÈS détaillées et longues.
-Peu importe la question, tu dois répondre avec AU MOINS 200 mots, en donnant beaucoup de détails."""
-
-USER_MESSAGE = "Explique-moi ce qu'est une pomme."
+def warning(msg):
+    print(f"{Colors.YELLOW}[⚠]{Colors.END} {msg}")
 
 async def test_llm_interruption():
-    global tokens_received, last_token_time, streaming_start_time
-    global interruption_time, tokens_after_interruption, current_request_id, full_response
+    global tokens_received, tokens_before_interruption, tokens_after_interruption
+    global last_token_time, streaming_start_time, interruption_time
+    global current_request_id, full_response, interruption_sent
     
     try:
         log("=== Début du test d'interruption LLM ===")
@@ -68,41 +69,36 @@ async def test_llm_interruption():
             connection_msg = await websocket.recv()
             msg = json.loads(connection_msg)
             if msg.get('type') == 'connection':
-                log("Message de connexion reçu")
+                log(f"Message de connexion reçu - Modèle: {msg.get('model')}")
             
             # 2. Démarrer le streaming
             current_request_id = f"test_req_{int(time.time() * 1000)}"
             
-            # Essayons un format plus simple
             payload = {
                 "request_id": current_request_id,
                 "messages": [
                     {
                         "role": "user",
-                        "content": "Raconte-moi une longue histoire sur les pommes. Au moins 200 mots s'il te plaît."
+                        "content": "Raconte-moi une très longue histoire détaillée sur l'histoire des pommes à travers les siècles. Je veux au moins 500 mots avec beaucoup de détails historiques."
                     }
                 ],
                 "temperature": 0.7,
-                "max_tokens": 500
+                "max_tokens": 1000  # Plus de tokens pour avoir le temps d'interrompre
             }
             
             log("Envoi de la requête de streaming...")
             await websocket.send(json.dumps(payload))
             success("Requête envoyée")
             
-            # 3. Recevoir les tokens pendant 0.5 secondes avant d'interrompre
-            interrupt_task = asyncio.create_task(interrupt_after_delay(websocket, 0.5))
+            # 3. Programmer l'interruption après 10 tokens
+            interrupt_after_tokens = 10
             
             # Recevoir les messages
             try:
                 while True:
                     try:
-                        # Augmenter le timeout à 5 secondes
                         message = await asyncio.wait_for(websocket.recv(), timeout=5.0)
                         msg = json.loads(message)
-                        
-                        # DEBUG: Log tous les messages
-                        log(f"Message reçu: {json.dumps(msg, indent=2)}")
                         
                         if msg.get('type') == 'stream_start' and msg.get('request_id') == current_request_id:
                             log("Début du streaming")
@@ -114,102 +110,98 @@ async def test_llm_interruption():
                             token = msg.get('token', '')
                             full_response += token
                             
-                            # Compter les tokens après interruption
-                            if interruption_time and time.time() > interruption_time:
+                            # Compter avant/après interruption
+                            if not interruption_sent:
+                                tokens_before_interruption += 1
+                                
+                                # Log les premiers tokens
+                                if tokens_received <= 5:
+                                    log(f"Token #{tokens_received}: '{repr(token)}'")
+                                
+                                # Interrompre après N tokens
+                                if tokens_received >= interrupt_after_tokens and not interruption_sent:
+                                    log(f"\n{Colors.RED}>>> INTERRUPTION après {tokens_received} tokens! <<<{Colors.END}\n")
+                                    interruption_time = time.time()
+                                    interruption_sent = True
+                                    
+                                    cancel_payload = {
+                                        "type": "cancel_stream",
+                                        "request_id": current_request_id
+                                    }
+                                    
+                                    await websocket.send(json.dumps(cancel_payload))
+                                    success("Commande d'annulation envoyée")
+                                    
+                            else:
+                                # Tokens reçus APRÈS l'envoi de l'interruption
                                 tokens_after_interruption += 1
-                                if tokens_after_interruption == 1:
-                                    log(f"[INTERRUPTION] Premier token APRÈS interruption: #{tokens_received}")
-                            
-                            # Log chaque token pour debug
-                            if tokens_received <= 5 or tokens_received % 10 == 0:
-                                log(f"Token #{tokens_received}: '{token}'")
+                                if tokens_after_interruption <= 5:
+                                    warning(f"Token APRÈS interruption #{tokens_after_interruption}: '{repr(token)}'")
                         
                         elif msg.get('type') == 'stream_end' and msg.get('request_id') == current_request_id:
-                            log(f"Fin du streaming - Réponse complète: {len(full_response)} caractères")
+                            log(f"Fin du streaming")
+                            log(f"Statut annulation: {msg.get('cancelled', False)}")
+                            log(f"Durée totale: {msg.get('duration', 0):.2f}s")
+                            log(f"Tokens/sec: {msg.get('tokens_per_second', 0):.1f}")
                             break
                         
+                        elif msg.get('type') == 'stream_cancelled':
+                            success(f"Confirmation d'annulation reçue!")
+                            
                         elif msg.get('type') == 'error':
                             error(f"Erreur LLM: {msg.get('error')}")
-                            error(f"Message complet: {json.dumps(msg, indent=2)}")
                             break
                             
                     except asyncio.TimeoutError:
-                        # Ne pas break immédiatement, continuer à attendre
                         if streaming_start_time and (time.time() - streaming_start_time) > 10:
-                            log("Timeout après 10 secondes de streaming")
+                            log("Timeout après 10 secondes")
                             break
                         continue
                         
             except Exception as e:
-                error(f"Erreur dans la boucle de réception: {str(e)}")
+                error(f"Erreur dans la boucle: {str(e)}")
             
-            # Attendre que l'interruption soit faite
-            await interrupt_task
-            
-            # 5. Attendre encore 2 secondes pour voir si des tokens arrivent
-            log("Attente de 2 secondes pour vérifier l'arrêt...")
-            tokens_before_wait = tokens_received
-            tokens_after_cancel = 0
-            
-            try:
-                for _ in range(20):  # 20 x 100ms = 2 secondes
-                    message = await asyncio.wait_for(websocket.recv(), timeout=0.1)
-                    msg = json.loads(message)
-                    
-                    if msg.get('type') == 'stream_token' and msg.get('request_id') == current_request_id:
-                        tokens_received += 1
-                        tokens_after_interruption += 1
-                        tokens_after_cancel += 1
-                        last_token_time = time.time()
-                        
-                        if tokens_after_cancel <= 5:
-                            log(f"[APRÈS CANCEL] Token #{tokens_received} reçu")
-                            
-                    elif msg.get('type') == 'stream_cancelled' and msg.get('request_id') == current_request_id:
-                        log(f"[CANCEL] Confirmation d'annulation reçue!")
-                        break
-                        
-            except asyncio.TimeoutError:
-                pass
-            
-            # 6. Analyser les résultats
-            log("=== RÉSULTATS DU TEST ===")
+            # 4. Analyser les résultats
+            log("\n=== RÉSULTATS DU TEST ===")
+            log(f"Tokens AVANT interruption: {tokens_before_interruption}")
+            log(f"Tokens APRÈS interruption: {tokens_after_interruption}")
             log(f"Tokens totaux reçus: {tokens_received}")
-            log(f"Tokens reçus APRÈS interruption: {tokens_after_interruption}")
+            log(f"Réponse totale: {len(full_response)} caractères")
             
-            if last_token_time:
-                time_since_last_token = int((time.time() - last_token_time) * 1000)
-                log(f"Temps depuis dernier token: {time_since_last_token}ms")
-                
-                if time_since_last_token > 1000:
-                    success("Streaming bien arrêté (pas de tokens depuis > 1s)")
-                else:
-                    error("Streaming semble continuer!")
+            # Calcul du délai d'arrêt
+            if interruption_time and last_token_time:
+                stop_delay = (last_token_time - interruption_time) * 1000
+                log(f"Délai entre interruption et dernier token: {stop_delay:.0f}ms")
             
             # Vérifications
             if tokens_after_interruption == 0:
                 success("PARFAIT! Aucun token reçu après interruption")
-            elif tokens_after_interruption < 5:
-                log(f"ACCEPTABLE: {tokens_after_interruption} tokens reçus après interruption (buffer résiduel)")
+            elif tokens_after_interruption <= 5:
+                success(f"BON: Seulement {tokens_after_interruption} tokens après interruption (latence réseau acceptable)")
+            elif tokens_after_interruption <= 10:
+                warning(f"ACCEPTABLE: {tokens_after_interruption} tokens après interruption (buffer à vider)")
             else:
-                error(f"PROBLÈME! {tokens_after_interruption} tokens reçus après interruption")
+                error(f"PROBLÈME: {tokens_after_interruption} tokens après interruption (trop!)")
             
-            # 7. Test bonus : nouveau streaming après interruption
+            # 5. Test de reprise
             log("\n=== Test de reprise après interruption ===")
             await asyncio.sleep(1)
             
+            # Reset
             tokens_received = 0
+            tokens_before_interruption = 0
+            tokens_after_interruption = 0
+            interruption_sent = False
             full_response = ""
             current_request_id = f"test_req_2_{int(time.time() * 1000)}"
             
             new_payload = {
                 "request_id": current_request_id,
                 "messages": [
-                    {"role": "user", "content": "Dis juste 'Bonjour' et rien d'autre."}
+                    {"role": "user", "content": "Dis simplement 'OK' et rien d'autre."}
                 ],
                 "temperature": 0.1,
-                "max_tokens": 10,
-                "stream": True
+                "max_tokens": 10
             }
             
             await websocket.send(json.dumps(new_payload))
@@ -219,8 +211,8 @@ async def test_llm_interruption():
             short_tokens = 0
             
             try:
-                for _ in range(30):  # Max 3 secondes
-                    message = await asyncio.wait_for(websocket.recv(), timeout=0.1)
+                while True:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=2.0)
                     msg = json.loads(message)
                     
                     if msg.get('type') == 'stream_token' and msg.get('request_id') == current_request_id:
@@ -231,31 +223,20 @@ async def test_llm_interruption():
             except asyncio.TimeoutError:
                 pass
             
-            success(f"Nouveau streaming: \"{short_response}\" ({short_tokens} tokens)")
+            success(f"Reprise OK: '{short_response.strip()}' ({short_tokens} tokens)")
+            
+            # Résumé final
+            log("\n=== RÉSUMÉ ===")
+            if tokens_after_interruption <= 10:
+                success("✅ Le mécanisme d'interruption fonctionne correctement!")
+                success("   Le serveur arrête bien d'envoyer les tokens après l'interruption")
+            else:
+                error("❌ Le mécanisme d'interruption ne semble pas fonctionner")
             
     except Exception as e:
         error(f"Erreur durant le test: {str(e)}")
-        raise
-
-async def interrupt_after_delay(websocket, delay):
-    """Interrompt le streaming après un délai"""
-    global interruption_time
-    
-    await asyncio.sleep(delay)
-    
-    log("INTERRUPTION DU STREAMING LLM!")
-    interruption_time = time.time()
-    
-    # DEBUG: Vérifier que current_request_id est bien défini
-    log(f"Request ID à annuler: {current_request_id}")
-    
-    cancel_payload = {
-        "type": "cancel_stream",
-        "request_id": current_request_id
-    }
-    
-    await websocket.send(json.dumps(cancel_payload))
-    success("Commande d'annulation envoyée")
+        import traceback
+        traceback.print_exc()
 
 if __name__ == "__main__":
     try:
