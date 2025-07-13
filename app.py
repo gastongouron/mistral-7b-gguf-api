@@ -1,7 +1,7 @@
 """
 API FastAPI pour servir le modèle Qwen2.5-32B GGUF avec llama-cpp-python
-Optimisé pour conversations médicales françaises avec streaming et interruption
-Version 7.1.0 - Qwen Edition Optimisée
+Optimisé pour Q6_K avec support multi-utilisateurs et streaming interruptible
+Version 8.0.0 - Production Ready
 """
 import os
 import time
@@ -17,72 +17,91 @@ import sys
 import subprocess
 import threading
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query
+from fastapi import FastAPI, HTTPException, Depends, Header, WebSocket, WebSocketDisconnect, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator
+from typing import List, Optional, Dict, Any, Tuple, AsyncGenerator, Union
 from llama_cpp import Llama
 from concurrent.futures import ThreadPoolExecutor
 import weakref
+from datetime import datetime, timedelta
+import hashlib
 
 # Import des métriques Prometheus
 from prometheus_client import Counter, Histogram, Gauge, Info, generate_latest, CONTENT_TYPE_LATEST
 
-# Configuration pour Qwen2.5-32B Q8_0 (meilleure qualité pour 94GB RAM)
-MODEL_PATH = "/workspace/models/Qwen2.5-32B-Instruct-Q8_0.gguf"
-MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q8_0.gguf"
+# Configuration pour Qwen2.5-32B Q6_K (optimisé multi-users)
+MODEL_PATH = "/workspace/models/Qwen2.5-32B-Instruct-Q6_K.gguf"
+MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/main/Qwen2.5-32B-Instruct-Q6_K.gguf"
 
+# Configuration environnement
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
+MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "15"))
+MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "200"))
+ENABLE_RATE_LIMITING = os.getenv("ENABLE_RATE_LIMITING", "true").lower() == "true"
 
 # Configuration du logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-
-# Configuration VoxImplant
-VOXIMPLANT_FIN_MARKER = "##FIN_COLLECTE##"
-VOXIMPLANT_FIN_KEYWORDS = ["parfait", "j'ai toutes les informations nécessaires"]
+logger = logging.getLogger(__name__)
 
 # ===== MÉTRIQUES PROMETHEUS =====
 system_info = Info('fastapi_system', 'System information')
 system_info.info({
-    'model': 'qwen2.5-32b',
+    'model': 'qwen2.5-32b-q6k',
     'instance': socket.gethostname(),
     'pod_id': os.getenv('RUNPOD_POD_ID', 'local'),
-    'version': '7.1.0'  # Version Qwen Optimisée
+    'version': '8.0.0',
+    'max_concurrent_users': str(MAX_CONCURRENT_USERS)
 })
 
+# GPU Metrics
 gpu_utilization_percent = Gauge('gpu_utilization_percent', 'GPU utilization percentage')
 gpu_memory_used_bytes = Gauge('gpu_memory_used_bytes', 'GPU memory used in bytes')
 gpu_memory_total_bytes = Gauge('gpu_memory_total_bytes', 'GPU memory total in bytes')
 gpu_temperature_celsius = Gauge('gpu_temperature_celsius', 'GPU temperature in Celsius')
 gpu_power_watts = Gauge('gpu_power_watts', 'GPU power usage in watts')
+gpu_layers_offloaded = Gauge('gpu_layers_offloaded', 'Number of layers offloaded to GPU')
+
+# System Metrics
 cpu_usage_percent = Gauge('cpu_usage_percent', 'CPU usage percentage')
 memory_used_bytes = Gauge('memory_used_bytes', 'System memory used in bytes')
 memory_total_bytes = Gauge('memory_total_bytes', 'System memory total in bytes')
 disk_usage_percent = Gauge('disk_usage_percent', 'Disk usage percentage')
+
+# Request Metrics
 fastapi_requests_total = Counter('fastapi_requests_total', 'Total number of requests', ['method', 'endpoint', 'status'])
 fastapi_request_duration_seconds = Histogram('fastapi_request_duration_seconds', 'Request duration in seconds', ['method', 'endpoint'])
 fastapi_websocket_connections = Gauge('fastapi_websocket_connections', 'Number of active WebSocket connections')
+fastapi_concurrent_users = Gauge('fastapi_concurrent_users', 'Number of concurrent users')
+
+# Inference Metrics
 fastapi_inference_requests_total = Counter('fastapi_inference_requests_total', 'Total number of inference requests', ['model', 'status'])
-fastapi_inference_duration_seconds = Histogram('fastapi_inference_duration_seconds', 'Inference duration in seconds', ['model'], buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0])
+fastapi_inference_duration_seconds = Histogram('fastapi_inference_duration_seconds', 'Inference duration in seconds', ['model'], 
+                                                buckets=[0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 15.0, 30.0])
 fastapi_inference_queue_size = Gauge('fastapi_inference_queue_size', 'Current inference queue size')
 fastapi_inference_tokens_total = Counter('fastapi_inference_tokens_total', 'Total tokens processed', ['type'])
 fastapi_inference_tokens_per_second = Gauge('fastapi_inference_tokens_per_second', 'Tokens generated per second')
+
+# Model Metrics
 model_loaded = Gauge('model_loaded', 'Whether the model is loaded (1) or not (0)')
 model_loading_duration_seconds = Gauge('model_loading_duration_seconds', 'Time taken to load the model')
 model_download_progress = Gauge('model_download_progress', 'Model download progress in percentage')
+
+# JSON Parsing Metrics
 json_parse_success_total = Counter('json_parse_success_total', 'Number of successful JSON parses')
 json_parse_failure_total = Counter('json_parse_failure_total', 'Number of failed JSON parses')
+
+# Stream Metrics
 stream_cancellation_total = Counter('stream_cancellation_total', 'Number of stream cancellations')
 stream_cancellation_latency_seconds = Histogram('stream_cancellation_latency_seconds', 'Time from cancellation request to actual stop')
 
-inference_queue = asyncio.Queue(maxsize=1000)
-download_in_progress = False
-download_complete = False
+# Rate Limiting Metrics
+rate_limit_exceeded_total = Counter('rate_limit_exceeded_total', 'Number of rate limit exceeded events', ['user_id'])
 
 # ===== MODÈLES PYDANTIC =====
 class Message(BaseModel):
@@ -93,13 +112,14 @@ class ChatCompletionRequest(BaseModel):
     model: str = "qwen2.5-32b"
     messages: List[Message]
     temperature: Optional[float] = 0.1
-    max_tokens: Optional[int] = 4096
+    max_tokens: Optional[int] = 200
     top_p: Optional[float] = 0.9
-    top_k: Optional[int] = None
+    top_k: Optional[int] = 40
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
     response_format: Optional[Dict[str, str]] = None
     json_schema: Optional[Dict[str, Any]] = None
+    user: Optional[str] = None  # Pour tracking par utilisateur
 
 class Usage(BaseModel):
     prompt_tokens: int
@@ -119,128 +139,236 @@ class ChatCompletionResponse(BaseModel):
     choices: List[Choice]
     usage: Usage
 
-# Variable globale pour le modèle
-llm = None
-n_ctx = 4096  # Valeur par défaut
+class StreamDelta(BaseModel):
+    role: Optional[str] = None
+    content: Optional[str] = None
 
-# ===== GESTIONNAIRE DE STREAMS INTERRUPTIBLES =====
-class StreamManager:
-    """Gère les streams actifs et leur interruption"""
-    def __init__(self):
-        self.active_streams = {}
-        self.executor = ThreadPoolExecutor(max_workers=4)
+class StreamChoice(BaseModel):
+    index: int
+    delta: StreamDelta
+    finish_reason: Optional[str] = None
+
+class ChatCompletionChunk(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[StreamChoice]
+
+# ===== RATE LIMITER =====
+class RateLimiter:
+    """Rate limiter simple par utilisateur"""
+    def __init__(self, max_requests_per_minute: int = 30):
+        self.max_requests = max_requests_per_minute
+        self.requests = {}
         self._lock = threading.Lock()
     
-    def register_stream(self, request_id: str) -> threading.Event:
-        """Enregistre un nouveau stream et retourne son event de cancellation"""
+    def check_rate_limit(self, user_id: str) -> bool:
+        """Vérifie si l'utilisateur a dépassé la limite"""
+        if not ENABLE_RATE_LIMITING:
+            return True
+            
+        now = datetime.now()
+        minute_ago = now - timedelta(minutes=1)
+        
+        with self._lock:
+            # Nettoyer les anciennes entrées
+            if user_id in self.requests:
+                self.requests[user_id] = [
+                    req_time for req_time in self.requests[user_id] 
+                    if req_time > minute_ago
+                ]
+            else:
+                self.requests[user_id] = []
+            
+            # Vérifier la limite
+            if len(self.requests[user_id]) >= self.max_requests:
+                rate_limit_exceeded_total.labels(user_id=user_id).inc()
+                return False
+            
+            # Ajouter la nouvelle requête
+            self.requests[user_id].append(now)
+            return True
+
+# ===== GESTIONNAIRE DE RESSOURCES =====
+class ResourceManager:
+    """Gère les ressources et limites du système"""
+    def __init__(self):
+        self.active_users = set()
+        self.user_streams = {}  # user_id -> set of stream_ids
+        self._lock = threading.Lock()
+    
+    def can_accept_user(self, user_id: str) -> bool:
+        """Vérifie si on peut accepter un nouvel utilisateur"""
+        with self._lock:
+            if user_id in self.active_users:
+                return True  # Déjà actif
+            
+            if len(self.active_users) >= MAX_CONCURRENT_USERS:
+                return False
+            
+            self.active_users.add(user_id)
+            self.user_streams[user_id] = set()
+            fastapi_concurrent_users.set(len(self.active_users))
+            return True
+    
+    def register_stream(self, user_id: str, stream_id: str):
+        """Enregistre un stream pour un utilisateur"""
+        with self._lock:
+            if user_id in self.user_streams:
+                self.user_streams[user_id].add(stream_id)
+    
+    def unregister_stream(self, user_id: str, stream_id: str):
+        """Désenregistre un stream"""
+        with self._lock:
+            if user_id in self.user_streams:
+                self.user_streams[user_id].discard(stream_id)
+                
+                # Si l'utilisateur n'a plus de streams actifs
+                if not self.user_streams[user_id]:
+                    self.active_users.discard(user_id)
+                    del self.user_streams[user_id]
+                    fastapi_concurrent_users.set(len(self.active_users))
+    
+    def get_user_from_stream(self, stream_id: str) -> Optional[str]:
+        """Retrouve l'utilisateur d'un stream"""
+        with self._lock:
+            for user_id, streams in self.user_streams.items():
+                if stream_id in streams:
+                    return user_id
+        return None
+
+# ===== GESTIONNAIRE DE STREAMS OPTIMISÉ =====
+class OptimizedStreamManager:
+    """Version optimisée du gestionnaire de streams pour multi-users"""
+    def __init__(self):
+        self.active_streams = {}
+        self.executor = ThreadPoolExecutor(max_workers=8)  # Plus de workers
+        self._lock = threading.Lock()
+        self.resource_manager = ResourceManager()
+        
+        # Configuration optimisée pour conversation
+        self.chunk_size = 25  # Petits chunks pour réactivité
+        self.max_tokens_per_chunk = 50
+        self.stream_timeout = 15  # Timeout agressif
+    
+    def register_stream(self, request_id: str, user_id: str) -> threading.Event:
+        """Enregistre un nouveau stream avec gestion utilisateur"""
         cancel_event = threading.Event()
+        
         with self._lock:
             self.active_streams[request_id] = {
                 'cancel_event': cancel_event,
                 'start_time': time.time(),
                 'tokens_generated': 0,
-                'cancelled_at': None
+                'user_id': user_id,
+                'chunks_generated': 0
             }
+        
+        self.resource_manager.register_stream(user_id, request_id)
         return cancel_event
     
     def cancel_stream(self, request_id: str) -> bool:
-        """Annule un stream actif"""
+        """Annule un stream actif avec métriques"""
         with self._lock:
             if request_id in self.active_streams:
-                cancel_time = time.time()
                 stream_info = self.active_streams[request_id]
                 stream_info['cancel_event'].set()
-                stream_info['cancelled_at'] = cancel_time
                 
                 # Métriques
-                start_time = stream_info['start_time']
+                duration = time.time() - stream_info['start_time']
                 stream_cancellation_total.inc()
-                stream_cancellation_latency_seconds.observe(cancel_time - start_time)
+                stream_cancellation_latency_seconds.observe(duration)
                 
-                logging.info(f"[STREAM] Annulation demandée pour {request_id} après {stream_info['tokens_generated']} tokens")
+                logger.info(f"[STREAM] Cancelled {request_id} after {stream_info['tokens_generated']} tokens")
                 return True
         return False
     
     def unregister_stream(self, request_id: str):
-        """Retire un stream de la liste active"""
+        """Retire un stream et libère les ressources"""
         with self._lock:
             if request_id in self.active_streams:
+                user_id = self.active_streams[request_id]['user_id']
                 del self.active_streams[request_id]
+                
+        # Libérer les ressources utilisateur
+        if user_id:
+            self.resource_manager.unregister_stream(user_id, request_id)
     
-    def update_token_count(self, request_id: str, count: int):
-        """Met à jour le nombre de tokens générés"""
-        with self._lock:
-            if request_id in self.active_streams:
-                self.active_streams[request_id]['tokens_generated'] = count
-    
-    def is_cancelled(self, request_id: str) -> bool:
-        """Vérifie si un stream est annulé"""
-        with self._lock:
-            if request_id in self.active_streams:
-                return self.active_streams[request_id]['cancel_event'].is_set()
-        return False
-    
-    async def generate_async(self, llm_model, prompt: str, request_id: str, **kwargs) -> AsyncGenerator[Dict, None]:
-        """Génère des tokens avec interruption côté client uniquement"""
-        cancel_event = self.register_stream(request_id)
+    async def generate_async(self, llm_model, prompt: str, request_id: str, 
+                           user_id: str, **kwargs) -> AsyncGenerator[Dict, None]:
+        """Génération optimisée avec chunks et interruption"""
+        cancel_event = self.register_stream(request_id, user_id)
+        
+        # Limiter les tokens pour la conversation
+        original_max_tokens = min(kwargs.get('max_tokens', 200), MAX_TOKENS_PER_REQUEST)
         
         loop = asyncio.get_event_loop()
-        
-        # Réduire max_tokens pour limiter la génération inutile
-        original_max_tokens = kwargs.get('max_tokens', 200)
-        kwargs['max_tokens'] = min(original_max_tokens, 100)
-        
-        def generate_sync():
-            """Génération synchrone dans un thread"""
-            return llm_model(prompt, stream=True, **kwargs)
-        
-        # Lancer la génération dans un thread executor
-        future = loop.run_in_executor(self.executor, generate_sync)
+        tokens_generated = 0
+        full_text = ""
         
         try:
-            # Obtenir le générateur
-            stream = await future
-            tokens_generated = 0
+            # Générer par chunks pour permettre l'interruption
+            remaining_tokens = original_max_tokens
+            current_prompt = prompt
             
-            # Parcourir les tokens
-            for output in stream:
-                # Vérifier l'annulation AVANT d'envoyer
-                if cancel_event.is_set():
-                    logging.info(f"[STREAM] Arrêt de l'envoi pour {request_id} après {tokens_generated} tokens")
+            while remaining_tokens > 0 and not cancel_event.is_set():
+                # Taille du chunk actuel
+                chunk_tokens = min(self.chunk_size, remaining_tokens)
+                kwargs['max_tokens'] = chunk_tokens
+                
+                # Générer le chunk de manière synchrone
+                def generate_chunk():
+                    return llm_model(current_prompt, stream=True, **kwargs)
+                
+                # Exécuter dans le thread pool avec timeout
+                try:
+                    future = loop.run_in_executor(self.executor, generate_chunk)
+                    stream = await asyncio.wait_for(future, timeout=self.stream_timeout)
+                except asyncio.TimeoutError:
+                    logger.warning(f"[STREAM] Timeout for {request_id}")
                     break
                 
-                tokens_generated += 1
-                self.update_token_count(request_id, tokens_generated)
+                # Parcourir les tokens du chunk
+                chunk_text = ""
+                for output in stream:
+                    if cancel_event.is_set():
+                        break
+                    
+                    token = output['choices'][0]['text']
+                    chunk_text += token
+                    full_text += token
+                    tokens_generated += 1
+                    
+                    with self._lock:
+                        if request_id in self.active_streams:
+                            self.active_streams[request_id]['tokens_generated'] = tokens_generated
+                    
+                    yield output
+                    
+                    # Micro-pause pour permettre l'interruption
+                    await asyncio.sleep(0)
                 
-                # Yield le token seulement si pas annulé
-                yield output
+                # Préparer le prochain chunk
+                remaining_tokens -= chunk_tokens
+                current_prompt = prompt + full_text
                 
-                # Micro-pause pour permettre la réception du cancel
-                await asyncio.sleep(0)
-                
-                # Si on a atteint la limite, demander plus si nécessaire
-                if tokens_generated >= kwargs['max_tokens'] and tokens_generated < original_max_tokens:
-                    if not cancel_event.is_set():
-                        # Continuer avec un nouveau chunk
-                        kwargs['max_tokens'] = min(100, original_max_tokens - tokens_generated)
-                        stream = llm_model(prompt + output['choices'][0]['text'], stream=True, **kwargs)
+                # Vérifier si on doit continuer (pas de fin naturelle)
+                if chunk_text.strip().endswith(('.', '!', '?', '"', '\n')):
+                    break  # Fin naturelle de phrase
                     
         except Exception as e:
-            logging.error(f"[STREAM] Erreur: {str(e)}")
+            logger.error(f"[STREAM] Error in {request_id}: {str(e)}")
             raise
         finally:
             self.unregister_stream(request_id)
-            
-            # Logger ce qui s'est passé
-            with self._lock:
-                if request_id in self.active_streams:
-                    info = self.active_streams[request_id]
-                    if info.get('cancelled_at'):
-                        cancelled_after = info['cancelled_at'] - info['start_time']
-                        logging.info(f"[STREAM] {request_id} annulé après {cancelled_after:.2f}s, {tokens_generated} tokens envoyés")
 
-# Instance globale du gestionnaire de streams
-stream_manager = StreamManager()
+# Variables globales
+llm = None
+stream_manager = OptimizedStreamManager()
+rate_limiter = RateLimiter()
+download_in_progress = False
+download_complete = False
 
 # ===== AUTHENTIFICATION =====
 security = HTTPBearer()
@@ -255,28 +383,50 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         )
     return credentials.credentials
 
-# ===== FONCTIONS DE MÉTRIQUES =====
+def get_user_id(request: Request, token: str = Depends(verify_token)) -> str:
+    """Extrait l'ID utilisateur de la requête"""
+    # Priorité : header X-User-ID > paramètre user > hash du token
+    user_id = request.headers.get('X-User-ID')
+    if not user_id and hasattr(request, 'json_body') and request.json_body:
+        user_id = request.json_body.get('user')
+    if not user_id:
+        # Générer un ID basé sur le token pour la session
+        user_id = hashlib.md5(f"{token}:{request.client.host}".encode()).hexdigest()[:8]
+    return user_id
+
+# ===== MÉTRIQUES SYSTÈME =====
 def update_gpu_metrics():
+    """Met à jour les métriques GPU"""
     try:
         import pynvml
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        
+        # Utilization
         util = pynvml.nvmlDeviceGetUtilizationRates(handle)
         gpu_utilization_percent.set(util.gpu)
+        
+        # Memory
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         gpu_memory_used_bytes.set(mem_info.used)
         gpu_memory_total_bytes.set(mem_info.total)
+        
+        # Temperature
         temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
         gpu_temperature_celsius.set(temp)
+        
+        # Power
         try:
             power = pynvml.nvmlDeviceGetPowerUsage(handle) / 1000.0
             gpu_power_watts.set(power)
         except:
             pass
+            
     except Exception as e:
-        logging.debug(f"Impossible de collecter les métriques GPU: {e}")
+        logger.debug(f"Could not collect GPU metrics: {e}")
 
 def update_system_metrics():
+    """Met à jour les métriques système"""
     try:
         cpu_usage_percent.set(psutil.cpu_percent(interval=0.1))
         mem = psutil.virtual_memory()
@@ -285,42 +435,27 @@ def update_system_metrics():
         disk = psutil.disk_usage('/')
         disk_usage_percent.set(disk.percent)
     except Exception as e:
-        logging.debug(f"Impossible de collecter les métriques système: {e}")
+        logger.debug(f"Could not collect system metrics: {e}")
 
 async def metrics_update_task():
+    """Tâche de mise à jour des métriques"""
     while True:
         update_gpu_metrics()
         update_system_metrics()
-        fastapi_inference_queue_size.set(inference_queue.qsize())
         await asyncio.sleep(5)
 
-# ===== FORMATTERS POUR QWEN =====
+# ===== FORMATTERS =====
 def format_messages_qwen(messages: List[Message]) -> str:
-    """Format ChatML pour Qwen2.5 avec renforcement des instructions"""
+    """Format ChatML pour Qwen2.5"""
     prompt = ""
-    
-    # Identifier le dernier message système (le plus important)
-    system_content = None
-    for msg in messages:
-        if msg.role == "system":
-            system_content = msg.content
-    
-    # Si on a un système prompt, le mettre en premier avec emphase
-    if system_content:
-        prompt += f"<|im_start|>system\n{system_content}\n<|im_end|>\n"
-    
-    # Ensuite ajouter l'historique de conversation
     for message in messages:
         if message.role == "system":
-            continue  # Déjà traité
+            prompt += f"<|im_start|>system\n{message.content}<|im_end|>\n"
         elif message.role == "user":
             prompt += f"<|im_start|>user\n{message.content}<|im_end|>\n"
         elif message.role == "assistant":
             prompt += f"<|im_start|>assistant\n{message.content}<|im_end|>\n"
-    
-    # Début de la réponse assistant
     prompt += "<|im_start|>assistant\n"
-    
     return prompt
 
 # ===== PARSING JSON AMÉLIORÉ =====
@@ -332,28 +467,29 @@ def clean_escaped_json(text: str) -> str:
     return text
 
 def extract_json_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Extrait le JSON d'un texte et retourne (json_str, remaining_text)
-    Version améliorée qui gère plusieurs formats
-    """
+    """Extrait le JSON d'un texte et retourne (json_str, remaining_text)"""
     text = text.strip()
     text = clean_escaped_json(text)
     
+    # Cas 1: JSON pur
     if text.startswith('{') and text.endswith('}'):
         return text, None
     
+    # Cas 2: JSON dans code block
     json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
     if json_match:
         json_str = json_match.group(1).strip()
         remaining = text[:json_match.start()] + text[json_match.end():]
         return json_str, remaining.strip() if remaining.strip() else None
     
+    # Cas 3: JSON avec préfixe
     json_prefix_match = re.search(r'(?:JSON|json|Json):\s*({.*?})', text, re.DOTALL)
     if json_prefix_match:
         json_str = json_prefix_match.group(1)
         remaining = text[:json_prefix_match.start()] + text[json_prefix_match.end():]
         return json_str, remaining.strip() if remaining.strip() else None
     
+    # Cas 4: Chercher les accolades
     start = text.find('{')
     if start != -1:
         count = 0
@@ -375,21 +511,19 @@ def extract_json_from_text(text: str) -> Tuple[Optional[str], Optional[str]]:
     return None, text
 
 def smart_json_parse(text: str) -> Dict[str, Any]:
-    """
-    Parse intelligent du JSON avec plusieurs stratégies de récupération
-    """
+    """Parse intelligent du JSON avec récupération d'erreurs"""
     original_text = text
-    
     json_str, remaining_text = extract_json_from_text(text)
     
     if not json_str:
-        logging.warning("Aucun JSON trouvé dans la réponse")
+        logger.warning("No JSON found in response")
         json_parse_failure_total.inc()
         return {
             "error": "No JSON found in response",
             "original_response": original_text
         }
     
+    # Tentative 1: Parse direct
     try:
         result = json.loads(json_str)
         json_parse_success_total.inc()
@@ -399,11 +533,11 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
                 "additional_text": remaining_text,
                 "json_extracted": True
             }
-        
         return result
     except json.JSONDecodeError as e:
-        logging.warning(f"Première tentative de parsing échouée: {e}")
+        logger.warning(f"First parse attempt failed: {e}")
     
+    # Tentative 2: Nettoyage basique
     json_str = re.sub(r'//.*?$', '', json_str, flags=re.MULTILINE)
     json_str = re.sub(r',\s*}', '}', json_str)
     json_str = re.sub(r',\s*]', ']', json_str)
@@ -418,11 +552,11 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
                 "json_extracted": True,
                 "required_cleanup": True
             }
-        
         return result
     except json.JSONDecodeError as e:
-        logging.warning(f"Deuxième tentative échouée: {e}")
+        logger.warning(f"Second parse attempt failed: {e}")
     
+    # Tentative 3: Réparation agressive
     json_str = re.sub(r'(\w+):', r'"\1":', json_str)
     json_str = re.sub(r'\btrue\b', 'true', json_str, flags=re.IGNORECASE)
     json_str = re.sub(r'\bfalse\b', 'false', json_str, flags=re.IGNORECASE)
@@ -438,10 +572,9 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
                 "json_extracted": True,
                 "heavy_cleanup": True
             }
-        
         return result
     except json.JSONDecodeError as e:
-        logging.error(f"Toutes les tentatives de parsing ont échoué: {e}")
+        logger.error(f"All parse attempts failed: {e}")
         json_parse_failure_total.inc()
         
         return {
@@ -452,9 +585,7 @@ def smart_json_parse(text: str) -> Dict[str, Any]:
         }
 
 def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> str:
-    """
-    S'assure que la réponse est un JSON valide
-    """
+    """S'assure que la réponse est un JSON valide"""
     if request_format and request_format.get("type") == "json_object":
         parsed = smart_json_parse(text)
         
@@ -467,19 +598,18 @@ def ensure_json_response(text: str, request_format: Optional[Dict] = None) -> st
 
 # ===== GESTION DU MODÈLE =====
 def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 5):
-    """Télécharge avec retry et gestion des erreurs 429"""
+    """Télécharge avec retry et gestion des erreurs"""
     import urllib.error
     
     hf_token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
     
     if not hf_token:
-        print("⚠️  ATTENTION: Pas de token HuggingFace trouvé!")
-        print("   Définissez la variable HF_TOKEN pour éviter les erreurs 429")
-        print("   export HF_TOKEN='votre_token_ici'")
+        print("⚠️  WARNING: No HuggingFace token found!")
+        print("   Set HF_TOKEN environment variable to avoid 429 errors")
     
-    # Pour Qwen, essayer d'abord avec huggingface-cli
+    # Essayer huggingface-cli en premier
     if hf_token and subprocess.run(["which", "huggingface-cli"], capture_output=True).returncode == 0:
-        print("🔑 Token HuggingFace détecté, utilisation de huggingface-cli...")
+        print("🔑 HuggingFace token detected, using huggingface-cli...")
         try:
             subprocess.run(["huggingface-cli", "login", "--token", hf_token], 
                          capture_output=True, check=True)
@@ -487,37 +617,34 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
             hf_cmd = [
                 "huggingface-cli", "download",
                 "bartowski/Qwen2.5-32B-Instruct-GGUF",
-                "Qwen2.5-32B-Instruct-Q8_0.gguf",
+                "Qwen2.5-32B-Instruct-Q6_K.gguf",
                 "--local-dir", os.path.dirname(dest),
                 "--local-dir-use-symlinks", "False"
             ]
             
-            print("📥 Téléchargement avec huggingface-cli...")
+            print("📥 Downloading with huggingface-cli...")
             result = subprocess.run(hf_cmd, text=True)
             if result.returncode == 0:
-                print("✅ Téléchargement réussi avec huggingface-cli!")
+                print("✅ Download successful!")
                 return True
-            else:
-                print(f"⚠️ Échec huggingface-cli, tentative avec méthodes alternatives...")
         except Exception as e:
-            print(f"⚠️ Erreur avec huggingface-cli: {e}")
+            print(f"⚠️ huggingface-cli failed: {e}")
     
-    # Fallback sur les méthodes alternatives
+    # Fallback sur téléchargement direct
     for attempt in range(max_retries):
         try:
             if attempt > 0:
                 wait_time = delay * (2 ** attempt)
-                print(f"\n⏳ Attente de {wait_time}s avant nouvelle tentative...")
+                print(f"\n⏳ Waiting {wait_time}s before retry...")
                 time.sleep(wait_time)
             
-            print(f"\n📥 Tentative {attempt + 1}/{max_retries}")
+            print(f"\n📥 Attempt {attempt + 1}/{max_retries}")
             
             headers = {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             }
             if hf_token:
                 headers['Authorization'] = f'Bearer {hf_token}'
-                print("🔑 Utilisation du token HF dans les headers")
             
             request = urllib.request.Request(url, headers=headers)
             
@@ -527,126 +654,106 @@ def download_with_retry(url: str, dest: str, max_retries: int = 3, delay: int = 
                 mb_downloaded = downloaded / 1024 / 1024
                 mb_total = total_size / 1024 / 1024
                 model_download_progress.set(percent)
-                sys.stdout.write(f'\rTéléchargement: {percent:.1f}% ({mb_downloaded:.1f}/{mb_total:.1f} MB) ')
+                sys.stdout.write(f'\rDownload: {percent:.1f}% ({mb_downloaded:.1f}/{mb_total:.1f} MB) ')
                 sys.stdout.flush()
             
             urllib.request.urlretrieve(request.full_url, dest, reporthook=download_progress)
-            print("\n✅ Téléchargement réussi!")
+            print("\n✅ Download complete!")
             return True
             
         except urllib.error.HTTPError as e:
             if e.code == 429:
-                print(f"\n⚠️ Erreur 429: Limite de taux dépassée")
+                print(f"\n⚠️ Error 429: Rate limit exceeded")
                 if not hf_token:
-                    print("💡 Conseil: Définissez HF_TOKEN pour éviter cette erreur")
+                    print("💡 Tip: Set HF_TOKEN to avoid this error")
                 if attempt < max_retries - 1:
                     continue
             else:
-                print(f"\n❌ Erreur HTTP {e.code}: {e.reason}")
+                print(f"\n❌ HTTP Error {e.code}: {e.reason}")
                 if attempt < max_retries - 1:
                     continue
                 raise
     
-    print("\n🔧 Tentative finale avec wget...")
-    try:
-        wget_cmd = ["wget", "-c", "-O", dest, url]
-        if hf_token:
-            wget_cmd.extend(["--header", f"Authorization: Bearer {hf_token}"])
-        subprocess.run(wget_cmd, check=True)
-        return True
-    except:
-        print("\n❌ Toutes les tentatives ont échoué")
-        if not hf_token:
-            print("\n💡 Solution: Définissez la variable d'environnement HF_TOKEN")
-            print("   export HF_TOKEN='votre_token_huggingface'")
-        return False
+    return False
 
 def cleanup_old_models():
-    """Nettoie les anciens modèles GGUF avant de télécharger le nouveau"""
+    """Nettoie les anciens modèles avant téléchargement"""
     models_dir = "/workspace/models"
     
     print(f"\n{'='*60}")
-    print("🧹 NETTOYAGE DES ANCIENS MODÈLES")
+    print("🧹 CLEANING OLD MODELS")
     print(f"{'='*60}")
     
     try:
-        # Lister tous les fichiers GGUF
         import glob
         old_models = glob.glob(os.path.join(models_dir, "*.gguf"))
         
         if not old_models:
-            print("✅ Aucun ancien modèle trouvé")
+            print("✅ No old models found")
             return
         
         # Calculer l'espace utilisé
         total_size = sum(os.path.getsize(f) for f in old_models)
-        print(f"📊 Espace utilisé par les anciens modèles: {total_size / (1024**3):.1f} GB")
+        print(f"📊 Space used by old models: {total_size / (1024**3):.1f} GB")
         
-        # Supprimer les anciens modèles SAUF celui qu'on veut télécharger
+        # Supprimer les anciens modèles sauf Q6_K
         target_model = os.path.basename(MODEL_PATH)
         for model_file in old_models:
             if os.path.basename(model_file) != target_model:
-                print(f"🗑️  Suppression de: {os.path.basename(model_file)}")
+                print(f"🗑️  Deleting: {os.path.basename(model_file)}")
                 try:
                     os.remove(model_file)
-                    print(f"   ✅ Supprimé")
+                    print(f"   ✅ Deleted")
                 except Exception as e:
-                    print(f"   ❌ Erreur: {e}")
+                    print(f"   ❌ Error: {e}")
         
-        # Vérifier l'espace libre après nettoyage
+        # Vérifier l'espace libre
         import shutil
         stat = shutil.disk_usage(models_dir)
         free_gb = stat.free / (1024**3)
-        print(f"\n💾 Espace libre après nettoyage: {free_gb:.1f} GB")
+        print(f"\n💾 Free space after cleanup: {free_gb:.1f} GB")
         
-        # Vérifier si on a assez d'espace pour le nouveau modèle (Q8_0 ~34GB)
-        required_gb = 40  # 34GB pour le modèle + marge
+        # Q6_K ~25GB
+        required_gb = 30
         if free_gb < required_gb:
-            print(f"⚠️  ATTENTION: Seulement {free_gb:.1f} GB disponibles")
-            print(f"   Le modèle Qwen2.5-32B-Q8_0 nécessite ~34 GB")
-            print(f"   Il faudrait libérer encore {required_gb - free_gb:.1f} GB")
+            print(f"⚠️  WARNING: Only {free_gb:.1f} GB available")
+            print(f"   Q6_K model requires ~25 GB")
         else:
-            print(f"✅ Espace suffisant pour télécharger le nouveau modèle")
+            print(f"✅ Sufficient space for new model")
             
     except Exception as e:
-        print(f"❌ Erreur lors du nettoyage: {e}")
-        
+        print(f"❌ Cleanup error: {e}")
+    
     print(f"{'='*60}\n")
 
 def download_model_if_needed():
-    """Télécharger le modèle au premier démarrage si nécessaire"""
+    """Télécharge le modèle si nécessaire"""
     global download_in_progress, download_complete
     
-    # NETTOYER LES ANCIENS MODÈLES D'ABORD
     cleanup_old_models()
     
     if os.path.exists(MODEL_PATH):
         file_size = os.path.getsize(MODEL_PATH)
-        expected_size = 34_000_000_000  # ~34 GB pour Q8_0
-        if file_size > expected_size * 0.95:  # 95% de la taille attendue
-            print(f"✅ Modèle trouvé: {file_size / (1024**3):.1f} GB")
+        expected_size = 25_000_000_000  # ~25 GB pour Q6_K
+        if file_size > expected_size * 0.95:
+            print(f"✅ Model found: {file_size / (1024**3):.1f} GB")
             download_complete = True
             return
         else:
-            print(f"⚠️ Modèle incomplet ({file_size / (1024**3):.1f} GB), reprise du téléchargement...")    
+            print(f"⚠️ Incomplete model ({file_size / (1024**3):.1f} GB), resuming download...")
     
     if download_in_progress:
-        print("⏳ Téléchargement déjà en cours...")
+        print("⏳ Download already in progress...")
         return
     
     download_in_progress = True
     
-    urls = [
-        MODEL_URL,
-        "https://huggingface.co/Qwen/Qwen2.5-32B-Instruct-GGUF/resolve/main/qwen2_5-32b-instruct-q4_k_m.gguf?download=true",
-    ]
-    
     print(f"\n{'='*60}")
-    print(f"📥 TÉLÉCHARGEMENT DU MODÈLE QWEN2.5-32B")
+    print(f"📥 DOWNLOADING QWEN2.5-32B Q6_K")
     print(f"{'='*60}")
-    print(f"📦 Taille: ~34 GB (Q8_0 quantization - meilleure qualité)")
+    print(f"📦 Size: ~25 GB (Q6_K - optimal for multi-users)")
     print(f"📍 Destination: {MODEL_PATH}")
-    print(f"⏱️ Temps estimé: 20-30 minutes")
+    print(f"⏱️ Estimated time: 15-20 minutes")
     print(f"{'='*60}\n")
     
     os.makedirs(os.path.dirname(MODEL_PATH), exist_ok=True)
@@ -654,63 +761,41 @@ def download_model_if_needed():
     try:
         start_time = time.time()
         
-        success = False
-        for url in urls:
-            print(f"\n🔗 Essai avec : {url}")
-            if download_with_retry(url, MODEL_PATH):
-                success = True
-                break
-        
-        if not success:
-            raise Exception("Échec du téléchargement après toutes les tentatives")
-        
-        print("\n✅ Téléchargement terminé!")
+        if not download_with_retry(MODEL_URL, MODEL_PATH):
+            raise Exception("Download failed after all attempts")
         
         download_time = time.time() - start_time
-        print(f"⏱️ Temps de téléchargement: {download_time/60:.1f} minutes")
+        print(f"\n✅ Download completed in {download_time/60:.1f} minutes")
         
         file_size = os.path.getsize(MODEL_PATH)
-        print(f"📦 Taille du fichier: {file_size / (1024**3):.1f} GB")
+        print(f"📦 File size: {file_size / (1024**3):.1f} GB")
         
-        if file_size < 32_000_000_000:
-            raise Exception(f"Fichier trop petit: {file_size} bytes")
+        if file_size < 24_000_000_000:
+            raise Exception(f"File too small: {file_size} bytes")
         
         download_complete = True
         model_download_progress.set(100)
         
     except Exception as e:
-        print(f"\n❌ Erreur lors du téléchargement: {e}")
+        print(f"\n❌ Download error: {e}")
         download_in_progress = False
         model_download_progress.set(0)
-        
-        print("\n" + "="*60)
-        print("📋 TÉLÉCHARGEMENT MANUEL REQUIS")
-        print("="*60)
-        print("\nPour contourner la limite de HuggingFace :")
-        print(f"\n1. Téléchargez le modèle avec votre navigateur :")
-        print(f"   {MODEL_URL}")
-        print(f"\n2. Ou utilisez wget avec reprise :")
-        print(f"   wget -c '{MODEL_URL}' -O {MODEL_PATH}")
-        print(f"\n3. Ou utilisez huggingface-cli :")
-        print(f"   pip install huggingface-hub")
-        print(f"   huggingface-cli download bartowski/Qwen2.5-32B-Instruct-GGUF Qwen2.5-32B-Instruct-Q8_0.gguf --local-dir /workspace/models/")
-        print("\n" + "="*60)
-        
         raise
     finally:
         download_in_progress = False
 
 def load_model():
-    """Charger le modèle GGUF avec configuration optimale pour Qwen2.5-32B"""
-    global llm, n_ctx
+    """Charge le modèle Q6_K avec configuration optimale"""
+    global llm
     
     download_model_if_needed()
     
-    print(f"Chargement du modèle Qwen2.5-32B Q8_0 depuis {MODEL_PATH}...")
-    
-    handle = None  # Pour le diagnostic VRAM après chargement
+    print(f"\n{'='*60}")
+    print(f"🚀 LOADING QWEN2.5-32B Q6_K")
+    print(f"{'='*60}")
     
     try:
+        # Détection GPU
         import pynvml
         pynvml.nvmlInit()
         handle = pynvml.nvmlDeviceGetHandleByIndex(0)
@@ -718,66 +803,34 @@ def load_model():
         vram_gb = mem_info.total / (1024**3)
         vram_free_gb = mem_info.free / (1024**3)
         
-        print(f"VRAM totale: {vram_gb:.1f} GB")
-        print(f"VRAM libre: {vram_free_gb:.1f} GB")
+        print(f"📊 GPU Detection:")
+        print(f"   Total VRAM: {vram_gb:.1f} GB")
+        print(f"   Free VRAM: {vram_free_gb:.1f} GB")
         
-        # Qwen2.5-32B Q8_0 nécessite environ 34GB VRAM
-        if vram_gb >= 48:  # L40 48GB
-            n_gpu_layers = -1  # Tout sur GPU
-            print("Configuration: Modèle ENTIÈREMENT sur GPU (L40 détecté)")
-        elif vram_gb >= 40:
-            # CHANGEMENT ICI : Forcer tout sur GPU même avec 40-48GB
-            n_gpu_layers = -1  # TOUT sur GPU au lieu de 55
-            print("Configuration: Modèle ENTIÈREMENT sur GPU (40GB+ détecté)")
-            print("⚠️  Si OOM, réduire n_ctx à 2048")
-        elif vram_gb >= 34:
-            # Essayer quand même tout sur GPU avec contexte réduit
-            n_gpu_layers = -1
-            print("Configuration: Tentative modèle ENTIER sur GPU")
-            print("⚠️  ATTENTION: Contexte sera réduit à 2048 pour économiser la VRAM")
-        else:
-            print("="*60)
-            print("⚠️  ALERTE PERFORMANCE ⚠️")
-            print(f"VRAM insuffisante: {vram_gb:.1f}GB")
-            print("Qwen2.5-32B Q8_0 nécessite 34GB+ de VRAM")
-            print("="*60)
-            n_gpu_layers = int((vram_gb / 34) * 60)  # Proportionnel
-            
-        # Ajuster n_ctx selon la VRAM disponible
-        if vram_gb >= 44:
-            n_ctx = 4096  # Contexte complet
-        elif vram_gb >= 40:
-            n_ctx = 3072  # Contexte réduit
-        elif vram_gb >= 36:
-            n_ctx = 2048  # Contexte minimal
-        else:
-            n_ctx = 1024  # Survie
-            
-        print(f"Contexte configuré: {n_ctx} tokens")
-            
+        # FORCER tout sur GPU
+        n_gpu_layers = -1
+        print(f"✅ Configuration: ALL layers on GPU (forced)")
+        
     except Exception as e:
-        print(f"⚠️ Impossible de détecter la VRAM: {e}")
-        print("Tentative de chargement complet sur GPU quand même...")
-        n_gpu_layers = -1  # Forcer GPU même si détection échoue
-        n_ctx = 2048  # Contexte sûr par défaut
+        print(f"⚠️ GPU detection failed: {e}")
+        print("✅ Forcing GPU usage anyway...")
+        n_gpu_layers = -1
     
-    # Calculer le nombre de couches du modèle
-    # Qwen2.5-32B a environ 60 couches
-    total_layers = 60
-    
-    print(f"\nConfiguration finale:")
-    print(f"- Modèle: Qwen2.5-32B Q8_0")
-    print(f"- Couches totales: {total_layers}")
-    print(f"- Couches sur GPU: {n_gpu_layers if n_gpu_layers != -1 else 'TOUTES'}")
-    print(f"- Couches sur CPU: {0 if n_gpu_layers == -1 else max(0, total_layers - n_gpu_layers)}")
+    print(f"\n📋 Model Configuration:")
+    print(f"   Model: Qwen2.5-32B Q6_K")
+    print(f"   Context: 2048 tokens (optimized for multi-users)")
+    print(f"   GPU Layers: ALL")
+    print(f"   Batch Size: 512")
+    print(f"   Max Users: {MAX_CONCURRENT_USERS}")
     
     start_load = time.time()
     
+    # Configuration optimisée pour Q6_K multi-users
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=n_ctx,  # Utiliser la valeur calculée
-        n_threads=8,
-        n_gpu_layers=n_gpu_layers,
+        n_ctx=2048,  # Context réduit pour plus d'utilisateurs
+        n_threads=4,  # Threads CPU réduits
+        n_gpu_layers=n_gpu_layers,  # TOUT sur GPU
         n_batch=512,
         use_mmap=True,
         use_mlock=False,
@@ -789,82 +842,79 @@ def load_model():
         # Optimisations GPU
         f16_kv=True,
         logits_all=False,
-        vocab_only=False
+        vocab_only=False,
+        embedding=False,  # Pas d'embeddings
+        low_vram=False,   # On a assez de VRAM
+        # Optimisation multi-users
+        n_threads_batch=2  # Threads pour batching
     )
     
     load_time = time.time() - start_load
-    print(f"\n✅ Modèle chargé en {load_time:.1f} secondes")
+    print(f"\n✅ Model loaded in {load_time:.1f} seconds")
     model_loaded.set(1)
     model_loading_duration_seconds.set(load_time)
     
-    # NOUVEAU : Diagnostic VRAM après chargement
-    if handle:
-        try:
-            mem_info_after = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            vram_used_gb = mem_info_after.used / (1024**3)
-            vram_free_after_gb = mem_info_after.free / (1024**3)
-            print(f"\n📊 VRAM après chargement:")
-            print(f"   - Utilisée: {vram_used_gb:.1f} GB")
-            print(f"   - Libre: {vram_free_after_gb:.1f} GB")
-            print(f"   - Modèle occupe: {vram_used_gb - (vram_gb - vram_free_gb):.1f} GB")
-        except:
-            pass
+    # Mettre à jour la métrique des couches GPU
+    gpu_layers_offloaded.set(-1)  # -1 signifie toutes les couches
     
     # Test de performance
-    print("\n🧪 Test de performance...")
+    print("\n🧪 Performance test...")
     test_start = time.time()
     test_prompt = "<|im_start|>user\nBonjour<|im_end|>\n<|im_start|>assistant\n"
     
     result = llm(test_prompt, max_tokens=10, temperature=0.1)
     test_time = time.time() - test_start
     
-    print(f"⏱️ Temps pour 10 tokens: {test_time:.2f}s")
-    print(f"📊 Vitesse: {10/test_time:.1f} tokens/seconde")
+    print(f"⏱️ Time for 10 tokens: {test_time:.2f}s")
+    print(f"📊 Speed: {10/test_time:.1f} tokens/second")
     
-    if test_time > 2:
-        print("\n⚠️ Performance limitée")
-        print("   Vérifiez que le modèle est bien sur GPU")
-        print(f"   Couches GPU actuelles: {n_gpu_layers}")
+    if test_time > 1:
+        print("\n⚠️ Performance seems limited, checking GPU usage...")
     else:
-        print("\n✅ Excellente performance GPU!")
+        print("\n✅ Excellent GPU performance!")
     
     print(f"\n{'='*60}")
-    print("✅ Qwen2.5-32B Q8_0 chargé avec succès!")
+    print("✅ QWEN2.5-32B Q6_K READY FOR PRODUCTION")
     print(f"{'='*60}\n")
-    
+
 # ===== LIFESPAN =====
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Gestion du cycle de vie de l'application"""
-    print("=== Démarrage de l'application ===")
+    print("=== Starting FastAPI Application ===")
+    
+    # Démarrer les tâches de fond
     metrics_task = asyncio.create_task(metrics_update_task())
+    
     try:
+        # Charger le modèle
         model_start = time.time()
         load_model()
-        model_loading_duration_seconds.set(time.time() - model_start)
-        model_loaded.set(1)
-        print("=== Modèle chargé, API prête ===")
+        print("=== Model loaded, API ready ===")
     except Exception as e:
-        print(f"Erreur fatale lors du chargement du modèle: {e}")
+        print(f"Fatal error loading model: {e}")
         model_loaded.set(0)
     
     yield
     
-    print("=== Arrêt de l'application ===")
+    # Nettoyage
+    print("=== Shutting down ===")
     model_loaded.set(0)
     metrics_task.cancel()
+    
     try:
         await metrics_task
     except asyncio.CancelledError:
         pass
-    # Fermer le thread pool executor
+    
+    # Fermer le thread pool
     stream_manager.executor.shutdown(wait=True)
 
 # ===== APPLICATION FASTAPI =====
 app = FastAPI(
-    title="Qwen2.5-32B GGUF API",
-    version="7.1.0",
-    description="API FastAPI pour Qwen2.5-32B avec streaming et interruption asynchrone",
+    title="Qwen2.5-32B Q6_K Multi-User API",
+    version="8.0.0",
+    description="Production-ready API with streaming, interruption, and multi-user support",
     lifespan=lifespan
 )
 
@@ -880,220 +930,99 @@ app.add_middleware(
 
 @app.get("/metrics")
 async def metrics():
+    """Endpoint Prometheus metrics"""
     update_gpu_metrics()
     update_system_metrics()
     return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 @app.get("/")
 async def root():
+    """Root endpoint avec informations système"""
     return {
-        "message": "Qwen2.5-32B GGUF API with Async Interruption",
+        "message": "Qwen2.5-32B Q6_K Multi-User API",
         "status": "running" if llm is not None else "loading",
-        "model": "Qwen2.5-32B-Instruct-Q8_0.gguf",
-        "model_loaded": llm is not None,
-        "download_complete": download_complete,
-        "download_in_progress": download_in_progress,
+        "model": {
+            "name": "Qwen2.5-32B-Instruct-Q6_K.gguf",
+            "loaded": llm is not None,
+            "size": "~25GB",
+            "context": "2048 tokens",
+            "gpu_layers": "all"
+        },
+        "system": {
+            "max_concurrent_users": MAX_CONCURRENT_USERS,
+            "active_users": len(stream_manager.resource_manager.active_users),
+            "active_streams": len(stream_manager.active_streams),
+            "rate_limiting": ENABLE_RATE_LIMITING
+        },
         "features": [
-            "Streaming responses",
-            "Async stream interruption",
+            "Multi-user support (15+ concurrent)",
+            "Streaming with async interruption",
             "Intelligent JSON parsing",
-            "Natural conversation mode",
-            "Summary extraction endpoint",
-            "Better instruction following than Mixtral"
+            "Rate limiting per user",
+            "Resource management",
+            "Optimized for conversational AI"
         ],
-        "active_streams": len(stream_manager.active_streams),
-        "context_size": n_ctx,
         "endpoints": {
-            "/v1/chat/completions": "POST - Chat completions endpoint (requires Bearer token)",
-            "/ws": "WebSocket - Streaming chat endpoint with interruption support (requires token in query)",
-            "/v1/summary": "POST - Extract structured summary from conversation",
-            "/v1/models": "GET - List available models",
-            "/health": "GET - Health check",
-            "/metrics": "GET - Prometheus metrics",
-            "/download-status": "GET - Model download status",
-            "/v1/cleanup": "POST - Clean old models",
-            "/v1/disk-usage": "GET - Check disk usage"
+            "/v1/chat/completions": "OpenAI-compatible chat endpoint",
+            "/ws": "WebSocket streaming with interruption",
+            "/v1/summary": "Extract structured summary",
+            "/v1/models": "List available models",
+            "/health": "Health check with detailed status",
+            "/metrics": "Prometheus metrics"
         }
     }
 
 @app.get("/health")
 async def health_check():
+    """Health check détaillé"""
     health_status = {
         "status": "healthy" if llm is not None else "loading",
-        "model_loaded": llm is not None,
-        "model_path": MODEL_PATH,
-        "model_exists": os.path.exists(MODEL_PATH),
-        "download_complete": download_complete,
-        "download_in_progress": download_in_progress,
-        "active_streams": len(stream_manager.active_streams),
-        "context_size": n_ctx,
-        "json_parse_stats": {
-            "success": json_parse_success_total._value._value if hasattr(json_parse_success_total, '_value') else 0,
-            "failure": json_parse_failure_total._value._value if hasattr(json_parse_failure_total, '_value') else 0
+        "timestamp": datetime.now().isoformat(),
+        "model": {
+            "loaded": llm is not None,
+            "path": MODEL_PATH,
+            "exists": os.path.exists(MODEL_PATH),
+            "size": f"{os.path.getsize(MODEL_PATH) / (1024**3):.1f} GB" if os.path.exists(MODEL_PATH) else None
         },
-        "stream_cancellation_stats": {
-            "total": stream_cancellation_total._value._value if hasattr(stream_cancellation_total, '_value') else 0,
-            "active_streams": list(stream_manager.active_streams.keys())
+        "system": {
+            "active_users": len(stream_manager.resource_manager.active_users),
+            "max_users": MAX_CONCURRENT_USERS,
+            "active_streams": len(stream_manager.active_streams),
+            "active_stream_ids": list(stream_manager.active_streams.keys())[:5]  # Top 5
+        },
+        "performance": {
+            "json_parse_success": json_parse_success_total._value._value if hasattr(json_parse_success_total, '_value') else 0,
+            "json_parse_failure": json_parse_failure_total._value._value if hasattr(json_parse_failure_total, '_value') else 0,
+            "stream_cancellations": stream_cancellation_total._value._value if hasattr(stream_cancellation_total, '_value') else 0
         }
     }
-    if os.path.exists(MODEL_PATH):
-        health_status["model_size"] = f"{os.path.getsize(MODEL_PATH) / (1024**3):.1f} GB"
+    
+    # Vérifier si on est en surcharge
+    if len(stream_manager.resource_manager.active_users) >= MAX_CONCURRENT_USERS:
+        health_status["status"] = "overloaded"
+        health_status["message"] = "Maximum concurrent users reached"
+    
     return health_status
-
-@app.get("/download-status")
-async def download_status():
-    status = {
-        "download_complete": download_complete,
-        "download_in_progress": download_in_progress,
-        "model_exists": os.path.exists(MODEL_PATH),
-        "download_progress_percent": model_download_progress._value._value if hasattr(model_download_progress, '_value') else 0
-    }
-    if os.path.exists(MODEL_PATH):
-        status["current_size_gb"] = os.path.getsize(MODEL_PATH) / (1024**3)
-        status["expected_size_gb"] = 34.0  # Q8_0
-    return status
-
-@app.post("/v1/cleanup", dependencies=[Depends(verify_token)])
-async def cleanup_models(keep_current: bool = True):
-    """Nettoie les anciens modèles GGUF pour libérer de l'espace"""
-    try:
-        models_dir = "/workspace/models"
-        
-        # Lister tous les fichiers GGUF
-        import glob
-        all_models = glob.glob(os.path.join(models_dir, "*.gguf"))
-        
-        if not all_models:
-            return {
-                "status": "nothing_to_clean",
-                "message": "No GGUF models found",
-                "space_freed_gb": 0
-            }
-        
-        # Calculer l'espace avant
-        import shutil
-        stat_before = shutil.disk_usage(models_dir)
-        
-        # Identifier le modèle actuel
-        current_model_name = os.path.basename(MODEL_PATH)
-        
-        cleaned_models = []
-        space_freed = 0
-        errors = []
-        
-        for model_file in all_models:
-            model_name = os.path.basename(model_file)
-            
-            # Garder le modèle actuel si demandé
-            if keep_current and model_name == current_model_name:
-                continue
-            
-            try:
-                file_size = os.path.getsize(model_file)
-                os.remove(model_file)
-                cleaned_models.append({
-                    "name": model_name,
-                    "size_gb": file_size / (1024**3)
-                })
-                space_freed += file_size
-            except Exception as e:
-                errors.append({
-                    "model": model_name,
-                    "error": str(e)
-                })
-        
-        # Calculer l'espace après
-        stat_after = shutil.disk_usage(models_dir)
-        
-        return {
-            "status": "success",
-            "cleaned_models": cleaned_models,
-            "space_freed_gb": space_freed / (1024**3),
-            "disk_usage": {
-                "before": {
-                    "free_gb": stat_before.free / (1024**3),
-                    "used_gb": stat_before.used / (1024**3),
-                    "total_gb": stat_before.total / (1024**3)
-                },
-                "after": {
-                    "free_gb": stat_after.free / (1024**3),
-                    "used_gb": stat_after.used / (1024**3),
-                    "total_gb": stat_after.total / (1024**3)
-                }
-            },
-            "errors": errors if errors else None
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/v1/disk-usage")
-async def disk_usage():
-    """Vérifie l'utilisation du disque"""
-    try:
-        import shutil
-        
-        # Espace disque général
-        stat = shutil.disk_usage("/")
-        workspace_stat = shutil.disk_usage("/workspace")
-        
-        # Lister les modèles
-        import glob
-        models = []
-        models_dir = "/workspace/models"
-        
-        if os.path.exists(models_dir):
-            for model_file in glob.glob(os.path.join(models_dir, "*.gguf")):
-                try:
-                    size = os.path.getsize(model_file)
-                    models.append({
-                        "name": os.path.basename(model_file),
-                        "size_gb": size / (1024**3),
-                        "size_bytes": size
-                    })
-                except:
-                    pass
-        
-        models.sort(key=lambda x: x['size_bytes'], reverse=True)
-        
-        return {
-            "root_disk": {
-                "free_gb": stat.free / (1024**3),
-                "used_gb": stat.used / (1024**3),
-                "total_gb": stat.total / (1024**3),
-                "usage_percent": (stat.used / stat.total) * 100
-            },
-            "workspace_disk": {
-                "free_gb": workspace_stat.free / (1024**3),
-                "used_gb": workspace_stat.used / (1024**3),
-                "total_gb": workspace_stat.total / (1024**3),
-                "usage_percent": (workspace_stat.used / workspace_stat.total) * 100
-            },
-            "models": models,
-            "total_models_size_gb": sum(m['size_gb'] for m in models),
-            "required_for_new_model_gb": 34,  # Qwen2.5-32B Q8_0
-            "can_download_new_model": workspace_stat.free / (1024**3) > 40
-        }
-        
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/v1/models", dependencies=[Depends(verify_token)])
 async def list_models():
+    """Liste les modèles disponibles"""
     start_time = time.time()
     try:
         result = {
             "object": "list",
             "data": [
                 {
-                    "id": "qwen2.5-32b",
+                    "id": "qwen2.5-32b-q6k",
                     "object": "model",
                     "created": int(time.time()),
                     "owned_by": "Qwen Team",
                     "permission": [],
                     "root": "qwen2.5-32b",
                     "parent": None,
-                    "ready": llm is not None
+                    "ready": llm is not None,
+                    "context_length": 2048,
+                    "quantization": "Q6_K"
                 }
             ]
         }
@@ -1105,92 +1034,50 @@ async def list_models():
     finally:
         fastapi_request_duration_seconds.labels(method="GET", endpoint="/v1/models").observe(time.time() - start_time)
 
-@app.post("/v1/summary", dependencies=[Depends(verify_token)])
-async def create_summary(request: dict):
-    """Endpoint pour créer un résumé structuré de la conversation"""
-    if llm is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
-    try:
-        messages = request.get("messages", [])
-        
-        # Convertir les messages en objets Message pour la validation
-        validated_messages = [Message(**msg) for msg in messages]
-        
-        # Utiliser le formatter Qwen pour construire le prompt
-        prompt = format_messages_qwen(validated_messages)
-        
-        # Log pour debug
-        logging.info(f"[SUMMARY] Extraction avec {len(validated_messages)} messages")
-        
-        response = llm(
-            prompt,
-            max_tokens=500,
-            temperature=0.1,
-            top_p=0.9,
-            stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
-        )
-        
-        result_text = response['choices'][0]['text'].strip()
-        parsed_result = smart_json_parse(result_text)
-        
-        # Si le parsing a échoué, on retourne quand même une structure
-        if "error" in parsed_result:
-            logging.warning(f"[SUMMARY] Parsing JSON échoué: {parsed_result['error']}")
-        
-        return {
-            "status": "success",
-            "extraction": parsed_result,
-            "usage": response['usage']
-        }
-        
-    except Exception as e:
-        logging.error(f"Erreur création résumé: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.post("/v1/chat/completions", response_model=ChatCompletionResponse, dependencies=[Depends(verify_token)])
-async def chat_completions(request: ChatCompletionRequest):
-    """Endpoint compatible OpenAI avec parsing JSON intelligent"""
+@app.post("/v1/chat/completions", response_model=Union[ChatCompletionResponse, None])
+async def chat_completions(
+    request: ChatCompletionRequest,
+    user_id: str = Depends(get_user_id)
+):
+    """Endpoint compatible OpenAI avec gestion multi-users"""
     start_time = time.time()
     status = "success"
     
+    # Vérifier le modèle
     if llm is None:
-        if download_in_progress:
-            raise HTTPException(status_code=503, detail="Model is being downloaded. Please check /download-status for progress.")
-        else:
-            raise HTTPException(status_code=503, detail="Model not loaded. It will be downloaded on first access.")
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    # Vérifier le rate limit
+    if not rate_limiter.check_rate_limit(user_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    
+    # Vérifier les ressources
+    if not stream_manager.resource_manager.can_accept_user(user_id):
+        raise HTTPException(
+            status_code=503, 
+            detail=f"Server at capacity ({MAX_CONCURRENT_USERS} concurrent users)"
+        )
     
     try:
-        await inference_queue.put(request)
+        # Logging
+        logger.info(f"[CHAT] User {user_id}: {len(request.messages)} messages")
         
-        # Log pour debug
-        logging.info(f"[CHAT] Messages reçus: {[(m.role, m.content[:50] + '...' if len(m.content) > 50 else m.content) for m in request.messages]}")
-        
-        # Déterminer le format à utiliser
-        needs_json_format = False
-        if request.response_format and request.response_format.get("type") == "json_object":
-            needs_json_format = True
-        elif request.messages and request.messages[0].role == "system":
-            system_content = request.messages[0].content.lower()
-            if "json" in system_content or "extraction" in system_content:
-                needs_json_format = True
-        
-        # Toujours utiliser le formatteur Qwen
+        # Formatter le prompt
         prompt = format_messages_qwen(request.messages)
         
-        # Ajouter le schema JSON si fourni
-        if request.json_schema:
-            schema_instruction = f"\n\nYour response must conform to this JSON schema:\n{json.dumps(request.json_schema, indent=2)}"
-            prompt = prompt.rstrip() + schema_instruction + "\n\nResponse (JSON only):"
+        # Gérer le streaming
+        if request.stream:
+            # Retourner un générateur pour le streaming
+            return await handle_streaming_response(
+                prompt, request, user_id, start_time
+            )
         
-        logging.info(f"[CHAT] Format utilisé: Qwen ChatML")
-        logging.debug(f"[CHAT] Prompt final (200 premiers chars): {prompt[:200]}...")
-        
+        # Réponse non-streaming
         inference_start = time.time()
         
         response = llm(
             prompt,
-            max_tokens=request.max_tokens or 4096,
+            max_tokens=min(request.max_tokens or 200, MAX_TOKENS_PER_REQUEST),
             temperature=request.temperature or 0.1,
             top_p=request.top_p or 0.9,
             top_k=request.top_k or 40,
@@ -1199,11 +1086,10 @@ async def chat_completions(request: ChatCompletionRequest):
             repeat_penalty=1.1
         )
         
-        await inference_queue.get()
-        
         inference_duration = time.time() - inference_start
-        fastapi_inference_duration_seconds.labels(model="qwen2.5-32b").observe(inference_duration)
+        fastapi_inference_duration_seconds.labels(model="qwen2.5-32b-q6k").observe(inference_duration)
         
+        # Métriques tokens
         prompt_tokens = response['usage']['prompt_tokens']
         completion_tokens = response['usage']['completion_tokens']
         
@@ -1213,21 +1099,15 @@ async def chat_completions(request: ChatCompletionRequest):
         if inference_duration > 0:
             tps = completion_tokens / inference_duration
             fastapi_inference_tokens_per_second.set(tps)
-            logging.info(f"[PERF] Génération: {tps:.1f} tokens/sec, {inference_duration:.2f}s total")
+            logger.info(f"[PERF] User {user_id}: {tps:.1f} tokens/sec")
         
+        # Gérer la réponse JSON si demandée
         generated_text = response['choices'][0]['text'].strip()
         
-        # Si on attend du JSON et que response_format le demande
         if request.response_format and request.response_format.get("type") == "json_object":
             generated_text = ensure_json_response(generated_text, request.response_format)
-            
-            try:
-                parsed = json.loads(generated_text)
-                if "error" in parsed and "original_response" in parsed:
-                    logging.warning(f"JSON parsing failed, returning error structure: {parsed['error']}")
-            except:
-                pass
         
+        # Construire la réponse
         chat_response = ChatCompletionResponse(
             id=f"chatcmpl-{uuid.uuid4().hex[:8]}",
             created=int(time.time()),
@@ -1244,7 +1124,7 @@ async def chat_completions(request: ChatCompletionRequest):
             )
         )
         
-        fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="success").inc()
+        fastapi_inference_requests_total.labels(model="qwen2.5-32b-q6k", status="success").inc()
         return chat_response
         
     except HTTPException:
@@ -1252,12 +1132,124 @@ async def chat_completions(request: ChatCompletionRequest):
         raise
     except Exception as e:
         status = "error"
-        fastapi_inference_requests_total.labels(model="qwen2.5-32b", status="error").inc()
-        logging.error(f"Erreur lors de la génération: {str(e)}", exc_info=True)
+        fastapi_inference_requests_total.labels(model="qwen2.5-32b-q6k", status="error").inc()
+        logger.error(f"Generation error for user {user_id}: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         fastapi_requests_total.labels(method="POST", endpoint="/v1/chat/completions", status=status).inc()
         fastapi_request_duration_seconds.labels(method="POST", endpoint="/v1/chat/completions").observe(time.time() - start_time)
+
+async def handle_streaming_response(prompt: str, request: ChatCompletionRequest, 
+                                  user_id: str, start_time: float):
+    """Gère la réponse en streaming"""
+    request_id = f"stream_{uuid.uuid4().hex[:8]}"
+    
+    async def generate():
+        try:
+            # Headers SSE
+            yield "data: [DONE]\n\n".encode('utf-8')  # Pour initialiser le stream
+            
+            tokens_count = 0
+            async for output in stream_manager.generate_async(
+                llm,
+                prompt,
+                request_id,
+                user_id,
+                max_tokens=min(request.max_tokens or 200, MAX_TOKENS_PER_REQUEST),
+                temperature=request.temperature or 0.1,
+                top_p=request.top_p or 0.9,
+                top_k=request.top_k or 40,
+                stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+            ):
+                token = output['choices'][0]['text']
+                tokens_count += 1
+                
+                # Créer le chunk de stream
+                chunk = ChatCompletionChunk(
+                    id=request_id,
+                    created=int(time.time()),
+                    model=request.model,
+                    choices=[StreamChoice(
+                        index=0,
+                        delta=StreamDelta(content=token),
+                        finish_reason=None
+                    )]
+                )
+                
+                yield f"data: {chunk.json()}\n\n".encode('utf-8')
+            
+            # Chunk final
+            final_chunk = ChatCompletionChunk(
+                id=request_id,
+                created=int(time.time()),
+                model=request.model,
+                choices=[StreamChoice(
+                    index=0,
+                    delta=StreamDelta(),
+                    finish_reason="stop"
+                )]
+            )
+            
+            yield f"data: {final_chunk.json()}\n\n".encode('utf-8')
+            yield "data: [DONE]\n\n".encode('utf-8')
+            
+            # Métriques
+            duration = time.time() - start_time
+            if duration > 0:
+                tps = tokens_count / duration
+                fastapi_inference_tokens_per_second.set(tps)
+            
+            fastapi_inference_requests_total.labels(model="qwen2.5-32b-q6k", status="success").inc()
+            
+        except Exception as e:
+            logger.error(f"Streaming error for {user_id}: {str(e)}")
+            fastapi_inference_requests_total.labels(model="qwen2.5-32b-q6k", status="error").inc()
+            yield f"data: {{\"error\": \"{str(e)}\"}}\n\n".encode('utf-8')
+    
+    from fastapi.responses import StreamingResponse
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+@app.post("/v1/summary", dependencies=[Depends(verify_token)])
+async def create_summary(
+    request: dict,
+    user_id: str = Depends(get_user_id)
+):
+    """Endpoint pour créer un résumé structuré"""
+    if llm is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    # Rate limiting
+    if not rate_limiter.check_rate_limit(user_id):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded")
+    
+    try:
+        messages = request.get("messages", [])
+        validated_messages = [Message(**msg) for msg in messages]
+        
+        prompt = format_messages_qwen(validated_messages)
+        
+        logger.info(f"[SUMMARY] User {user_id}: {len(validated_messages)} messages")
+        
+        response = llm(
+            prompt,
+            max_tokens=500,
+            temperature=0.1,
+            top_p=0.9,
+            stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
+        )
+        
+        result_text = response['choices'][0]['text'].strip()
+        parsed_result = smart_json_parse(result_text)
+        
+        return {
+            "status": "success",
+            "extraction": parsed_result,
+            "usage": response['usage']
+        }
+        
+    except Exception as e:
+        logger.error(f"Summary error for {user_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/v1/warmup", dependencies=[Depends(verify_token)])
 async def warmup():
@@ -1266,7 +1258,6 @@ async def warmup():
         raise HTTPException(status_code=503, detail="Model not loaded")
     
     try:
-        # Faire une petite inférence pour warmup
         warmup_prompt = "<|im_start|>user\nBonjour<|im_end|>\n<|im_start|>assistant\n"
         
         start_time = time.time()
@@ -1286,56 +1277,41 @@ async def warmup():
         }
         
     except Exception as e:
-        logging.error(f"Erreur warmup: {str(e)}")
+        logger.error(f"Warmup error: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/v1/debug/prompt", dependencies=[Depends(verify_token)])
-async def debug_prompt(request: ChatCompletionRequest):
-    """Endpoint de debug pour voir le prompt généré sans appeler le modèle"""
-    try:
-        # Générer le prompt Qwen
-        prompt_qwen = format_messages_qwen(request.messages)
-        
-        return {
-            "messages_received": [
-                {
-                    "role": m.role,
-                    "content": m.content[:100] + "..." if len(m.content) > 100 else m.content
-                } for m in request.messages
-            ],
-            "format": "ChatML (Qwen)",
-            "prompt": prompt_qwen[:500] + "..." if len(prompt_qwen) > 500 else prompt_qwen,
-            "model_config": {
-                "temperature": request.temperature or 0.1,
-                "max_tokens": request.max_tokens or 4096,
-                "top_p": request.top_p or 0.9,
-                "top_k": request.top_k or 40
-            }
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-        
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
-    """Endpoint WebSocket avec streaming et interruption asynchrone"""
+    """WebSocket endpoint avec support multi-users et interruption"""
     if token != API_TOKEN:
         await websocket.close(code=1008, reason="Invalid token")
+        return
+    
+    # Extraire l'ID utilisateur
+    user_id = websocket.headers.get('X-User-ID', 
+                                    hashlib.md5(f"{token}:{websocket.client.host}".encode()).hexdigest()[:8])
+    
+    # Vérifier les ressources
+    if not stream_manager.resource_manager.can_accept_user(user_id):
+        await websocket.close(code=1008, reason="Server at capacity")
         return
     
     await websocket.accept()
     fastapi_websocket_connections.inc()
     
+    # Message de bienvenue
     welcome_msg = {
         "type": "connection",
         "status": "connected",
-        "model": "qwen2.5-32b",
+        "model": "qwen2.5-32b-q6k",
         "model_loaded": llm is not None,
+        "user_id": user_id,
         "capabilities": [
             "French medical conversations",
             "Streaming responses",
             "2K context window",
             "Async stream cancellation",
-            "Better instruction following"
+            "Multi-user support"
         ]
     }
     await websocket.send_json(welcome_msg)
@@ -1344,45 +1320,50 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
         while True:
             data = await websocket.receive_json()
             
-            # Gérer cancel_stream
+            # Gérer l'annulation
             if data.get("type") == "cancel_stream":
                 request_id = data.get("request_id")
                 if request_id:
                     cancelled = stream_manager.cancel_stream(request_id)
                     await websocket.send_json({
-                        "type": "stream_cancelled", 
+                        "type": "stream_cancelled",
                         "request_id": request_id,
                         "success": cancelled
                     })
-                    logging.info(f"[WS] Cancel stream {request_id}: {'success' if cancelled else 'not found'}")
+                    logger.info(f"[WS] User {user_id} cancelled stream {request_id}")
                 continue
             
+            # Vérifier le modèle
             if llm is None:
                 await websocket.send_json({"type": "error", "error": "Model not loaded"})
+                continue
+            
+            # Vérifier le rate limit
+            if not rate_limiter.check_rate_limit(user_id):
+                await websocket.send_json({
+                    "type": "error", 
+                    "error": "Rate limit exceeded"
+                })
                 continue
             
             try:
                 messages = [Message(**msg) for msg in data.get("messages", [])]
                 request_id = data.get("request_id") or f"ws_{uuid.uuid4().hex[:8]}"
                 
-                # Log pour debug
-                logging.info(f"[WS] Nouveau stream {request_id}: {[(m.role, len(m.content)) for m in messages]}")
+                logger.info(f"[WS] User {user_id} stream {request_id}: {len(messages)} messages")
                 
-                # Toujours utiliser le formatteur Qwen
+                # Formatter le prompt
                 prompt = format_messages_qwen(messages)
-                
-                logging.info(f"[WS] Format utilisé: Qwen ChatML")
                 
                 await websocket.send_json({
                     "type": "stream_start",
                     "request_id": request_id
                 })
                 
-                # Utiliser le stream manager pour la génération asynchrone
+                # Streaming avec gestion d'interruption
                 full_response = ""
                 tokens_count = 0
                 start_time = time.time()
-                last_token_time = start_time
                 cancelled = False
                 
                 try:
@@ -1390,7 +1371,8 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                         llm,
                         prompt,
                         request_id,
-                        max_tokens=data.get("max_tokens", 200),
+                        user_id,
+                        max_tokens=min(data.get("max_tokens", 200), MAX_TOKENS_PER_REQUEST),
                         temperature=data.get("temperature", 0.1),
                         top_p=data.get("top_p", 0.9),
                         top_k=data.get("top_k", 40),
@@ -1399,11 +1381,10 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                         token = output['choices'][0]['text']
                         full_response += token
                         tokens_count += 1
-                        last_token_time = time.time()
                         
-                        # Vérifier si la connexion est toujours ouverte
+                        # Vérifier la connexion
                         if websocket.client_state.value != 1:  # 1 = CONNECTED
-                            logging.info(f"[WS] Client déconnecté pendant stream {request_id}")
+                            logger.info(f"[WS] User {user_id} disconnected during stream")
                             cancelled = True
                             break
                         
@@ -1414,50 +1395,45 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                                 "request_id": request_id
                             })
                         except Exception as e:
-                            logging.info(f"[WS] Erreur envoi token: {e}")
+                            logger.info(f"[WS] Send error for {user_id}: {e}")
                             cancelled = True
                             break
                         
                 except asyncio.CancelledError:
                     cancelled = True
-                    logging.info(f"[WS] Stream {request_id} annulé après {tokens_count} tokens")
+                    logger.info(f"[WS] Stream {request_id} cancelled")
                 
                 # Calculer les métriques
                 duration = time.time() - start_time
-                if duration > 0:
-                    tps = tokens_count / duration
-                    fastapi_inference_tokens_per_second.set(tps)
+                tps = tokens_count / duration if duration > 0 else 0
                 
-                # Le stream a été interrompu si on n'a pas atteint max_tokens
-                was_cancelled = cancelled or (tokens_count < data.get("max_tokens", 200) - 10)
-                
-                # Vérifier que la connexion est toujours active avant d'envoyer la fin
-                if websocket.client_state.value == 1:  # 1 = CONNECTED
+                # Stream end seulement si connecté
+                if websocket.client_state.value == 1:
                     try:
                         await websocket.send_json({
                             "type": "stream_end",
                             "full_response": full_response,
                             "tokens": tokens_count,
                             "request_id": request_id,
-                            "cancelled": was_cancelled,
+                            "cancelled": cancelled,
                             "duration": duration,
-                            "tokens_per_second": tps if duration > 0 else 0,
-                            "time_since_last_token": time.time() - last_token_time
+                            "tokens_per_second": tps
                         })
-                    except Exception as e:
-                        logging.warning(f"[WS] Impossible d'envoyer stream_end: {e}")
-                else:
-                    logging.info(f"[WS] Client déconnecté, skip stream_end")
+                    except:
+                        pass
                 
-                logging.info(f"[WS] Stream {request_id} terminé: {tokens_count} tokens en {duration:.2f}s (annulé: {was_cancelled})")
+                logger.info(f"[WS] User {user_id} stream {request_id}: "
+                          f"{tokens_count} tokens in {duration:.2f}s "
+                          f"({tps:.1f} tps, cancelled: {cancelled})")
                 
+                # Métriques
                 fastapi_inference_requests_total.labels(
-                    model="qwen2.5-32b", 
-                    status="cancelled" if was_cancelled else "success"
+                    model="qwen2.5-32b-q6k",
+                    status="cancelled" if cancelled else "success"
                 ).inc()
                 
             except Exception as e:
-                logging.error(f"[WS] Erreur: {str(e)}", exc_info=True)
+                logger.error(f"[WS] Error for {user_id}: {str(e)}", exc_info=True)
                 if websocket.client_state.value == 1:
                     try:
                         await websocket.send_json({
@@ -1466,13 +1442,22 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                             "request_id": data.get("request_id")
                         })
                     except:
-                        pass  # Client déjà déconnecté
+                        pass
     
     except WebSocketDisconnect:
-        logging.info("[WS] Client déconnecté")
+        logger.info(f"[WS] User {user_id} disconnected")
     finally:
         fastapi_websocket_connections.dec()
+        # Libérer les ressources utilisateur
+        stream_manager.resource_manager.active_users.discard(user_id)
+        fastapi_concurrent_users.set(len(stream_manager.resource_manager.active_users))
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(
+        app, 
+        host="0.0.0.0", 
+        port=8000,
+        workers=1,  # Important: 1 seul worker pour partager le modèle
+        log_level="info"
+    )
