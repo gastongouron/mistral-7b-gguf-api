@@ -818,7 +818,7 @@ def load_model():
     
     print(f"\n📋 Model Configuration:")
     print(f"   Model: Qwen2.5-32B Q6_K")
-    print(f"   Context: 2048 tokens (optimized for multi-users)")
+    print(f"   Context: 4096 tokens (optimized for multi-users)")
     print(f"   GPU Layers: ALL")
     print(f"   Batch Size: 512")
     print(f"   Max Users: {MAX_CONCURRENT_USERS}")
@@ -828,7 +828,7 @@ def load_model():
     # Configuration optimisée pour Q6_K multi-users
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=2048,  # Context réduit pour plus d'utilisateurs
+        n_ctx=4096,  # Context réduit pour plus d'utilisateurs
         n_threads=4,  # Threads CPU réduits
         n_gpu_layers=n_gpu_layers,  # TOUT sur GPU
         n_batch=512,
@@ -945,7 +945,7 @@ async def root():
             "name": "Qwen2.5-32B-Instruct-Q6_K.gguf",
             "loaded": llm is not None,
             "size": "~25GB",
-            "context": "2048 tokens",
+            "context": "4096 tokens",
             "gpu_layers": "all"
         },
         "system": {
@@ -1021,7 +1021,7 @@ async def list_models():
                     "root": "qwen2.5-32b",
                     "parent": None,
                     "ready": llm is not None,
-                    "context_length": 2048,
+                    "context_length": 4096,
                     "quantization": "Q6_K"
                 }
             ]

@@ -39,22 +39,22 @@ Structure EXACTE attendue:
 }
 
 CATÉGORIES (utilise UNIQUEMENT une de ces valeurs):
-- emergency: urgence médicale, douleur forte, abcès
-- urgent_consultation: consultation urgente nécessaire
-- appointment_confirmation: confirmation de rendez-vous existant
-- appointment_create: nouvelle prise de rendez-vous
-- appointment_update: modification de rendez-vous
-- appointment_delete: annulation de rendez-vous
-- appointment_read: consultation/vérification d'un rendez-vous
-- retard: signalement de retard
-- prescription_renewal: renouvellement d'ordonnance
-- medical_certificate: demande de certificat médical
-- test_results: résultats d'examens
-- general_question: question générale
-- administrative: demande administrative
-- follow_up: suivi médical
-- non_categorise: non catégorisé
-- complex_question: demande complexe
+- emergency
+- urgent_consultation
+- appointment_confirmation
+- appointment_create
+- appointment_update
+- appointment_delete
+- appointment_read
+- retard
+- prescription_renewal
+- medical_certificate
+- test_results
+- general_question
+- administrative
+- follow_up
+- non_categorise
+- complex_question
 
 Choisis la catégorie la plus appropriée selon le contexte.
 
