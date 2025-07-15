@@ -828,16 +828,15 @@ def load_model():
     # Configuration optimisée pour Q6_K multi-users
     llm = Llama(
         model_path=MODEL_PATH,
-        n_ctx=4096,  # Context réduit pour plus d'utilisateurs
+        n_ctx=3072,  # Context réduit pour plus d'utilisateurs
         n_threads=24,  # Threads CPU réduits
         n_gpu_layers=n_gpu_layers,  # TOUT sur GPU
-        n_batch=3072,
+        n_batch=256,
         use_mmap=True,
         use_mlock=False,
         verbose=False,
         seed=42,
         # Paramètres Qwen
-        rope_freq_base=1000000,
         rope_freq_scale=1.0,
         # Optimisations GPU
         f16_kv=True,
@@ -846,7 +845,7 @@ def load_model():
         embedding=False,  # Pas d'embeddings
         low_vram=False,   # On a assez de VRAM
         # Optimisation multi-users
-        n_threads_batch=12,  # Threads pour batching
+        n_threads_batch=2,  # Threads pour batching
                
         # Gestion mémoire GPU
         tensor_split=None,  # Pas de split si 1 seul GPU
@@ -1236,7 +1235,7 @@ async def create_summary(
         
         response = llm(
             prompt,
-            max_tokens=500,
+            max_tokens=300,
             temperature=0.1,
             top_p=0.9,
             stop=["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
