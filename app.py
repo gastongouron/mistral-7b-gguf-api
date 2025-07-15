@@ -847,22 +847,10 @@ def load_model():
         low_vram=False,   # On a assez de VRAM
         # Optimisation multi-users
         n_threads_batch=12,  # Threads pour batching
-        mul_mat_q=True,  # Accélération des multiplications matricielles
-        offload_kqv=False,  # Garder KQV sur GPU
-        flash_attn=True,  # Si supporté par votre GPU (RTX 3090+)
-        n_parallel=6,  # Traiter 6 séquences en parallèle !
-        continuous_batching=True,  # CRITIQUE pour multi-users
-        # Cache optimisé
-        cache_type="f16",  # Cache quantifié pour économiser la VRAM
-       
+               
         # Gestion mémoire GPU
         tensor_split=None,  # Pas de split si 1 seul GPU
         main_gpu=0,  # GPU principal
-        
-        # Optimisation inference
-        n_predict=-1,  # Pas de limite globale
-        n_keep=0,  # Pas de tokens à garder
-        numa=True,
     )
     
     load_time = time.time() - start_load
