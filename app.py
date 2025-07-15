@@ -38,8 +38,8 @@ MODEL_URL = "https://huggingface.co/bartowski/Qwen2.5-32B-Instruct-GGUF/resolve/
 
 # Configuration environnement
 API_TOKEN = os.getenv("API_TOKEN", "supersecret")
-MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "15"))
-MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "200"))
+MAX_CONCURRENT_USERS = int(os.getenv("MAX_CONCURRENT_USERS", "9"))
+MAX_TOKENS_PER_REQUEST = int(os.getenv("MAX_TOKENS_PER_REQUEST", "150"))
 ENABLE_RATE_LIMITING = os.getenv("ENABLE_RATE_LIMITING", "true").lower() == "true"
 
 # Configuration du logging
@@ -248,9 +248,9 @@ class OptimizedStreamManager:
         self.resource_manager = ResourceManager()
         
         # Configuration optimisée pour conversation
-        self.chunk_size = 25  # Petits chunks pour réactivité
-        self.max_tokens_per_chunk = 50
-        self.stream_timeout = 15  # Timeout agressif
+        self.chunk_size = 15  # Petits chunks pour réactivité
+        self.max_tokens_per_chunk = 30
+        self.stream_timeout = 10  # Timeout agressif
     
     def register_stream(self, request_id: str, user_id: str) -> threading.Event:
         """Enregistre un nouveau stream avec gestion utilisateur"""
@@ -829,12 +829,12 @@ def load_model():
     llm = Llama(
         model_path=MODEL_PATH,
         n_ctx=4096,  # Context réduit pour plus d'utilisateurs
-        n_threads=8,  # Threads CPU réduits
+        n_threads=24,  # Threads CPU réduits
         n_gpu_layers=n_gpu_layers,  # TOUT sur GPU
-        n_batch=512,
+        n_batch=3072,
         use_mmap=True,
         use_mlock=False,
-        verbose=True,
+        verbose=False,
         seed=42,
         # Paramètres Qwen
         rope_freq_base=1000000,
@@ -846,7 +846,23 @@ def load_model():
         embedding=False,  # Pas d'embeddings
         low_vram=False,   # On a assez de VRAM
         # Optimisation multi-users
-        n_threads_batch=2  # Threads pour batching
+        n_threads_batch=12,  # Threads pour batching
+        mul_mat_q=True,  # Accélération des multiplications matricielles
+        offload_kqv=False,  # Garder KQV sur GPU
+        flash_attn=True,  # Si supporté par votre GPU (RTX 3090+)
+        n_parallel=6,  # Traiter 6 séquences en parallèle !
+        continuous_batching=True,  # CRITIQUE pour multi-users
+        # Cache optimisé
+        cache_type="f16",  # Cache quantifié pour économiser la VRAM
+       
+        # Gestion mémoire GPU
+        tensor_split=None,  # Pas de split si 1 seul GPU
+        main_gpu=0,  # GPU principal
+        
+        # Optimisation inference
+        n_predict=-1,  # Pas de limite globale
+        n_keep=0,  # Pas de tokens à garder
+        numa=True,
     )
     
     load_time = time.time() - start_load
