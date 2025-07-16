@@ -1441,19 +1441,71 @@ async def warmup():
 # ---------------------------------------------------------------------------
 # WebSocket /ws
 # ---------------------------------------------------------------------------
-
 @app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
+async def websocket_endpoint(websocket: WebSocket) -> None:
+    """
+    WebSocket entrypoint for live LLM streaming.
+
+    Changes vs. original:
+    - Accept handshake *before* auth/capacity so client gets a real WS (no HTTP 403 -> "Forbidden").
+    - Send structured JSON error messages prior to closing (Invalid token / Server at capacity / Model not loaded).
+    - Derive user_id from header, query params, or robust fallback (hash+rand) so VoxImplant need not send X-User-ID.
+    - Only increment/decrement connection gauges after we fully accept the user (pass capacity gate).
+    """
+    # ------------------------------------------------------------------
+    # Parse query params & accept handshake immediately
+    # ------------------------------------------------------------------
+    qp = dict(websocket.query_params)
+    token = qp.get("token")
+    await websocket.accept()
+
+    accepted_user = False  # track if we passed capacity gate & incremented metrics
+    user_id = None
+
+    # ------------------------------------------------------------------
+    # Auth token
+    # ------------------------------------------------------------------
     if token != API_TOKEN:
+        logger.warning("[WS] Reject: invalid token from %s", websocket.client)
+        await websocket.send_json({"type": "error", "error": "Invalid token"})
+        # 1008 = policy violation (standard, broadly supported)
         await websocket.close(code=1008, reason="Invalid token")
         return
-    user_id = websocket.headers.get('X-User-ID', hashlib.md5(f"{token}:{websocket.client.host}".encode()).hexdigest()[:8])
+
+    # ------------------------------------------------------------------
+    # User identification: header > qp > fallback hash+rand
+    # ------------------------------------------------------------------
+    user_id = (
+        websocket.headers.get("X-User-ID")
+        or qp.get("user")
+        or qp.get("uid")
+        or qp.get("call")
+        or (
+            hashlib.md5(f"{token}:{websocket.client.host}".encode()).hexdigest()[:8]
+            + "-"
+            + uuid.uuid4().hex[:4]
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # Capacity gate
+    # ------------------------------------------------------------------
     if not stream_manager.resource_manager.can_accept_user(user_id):
-        await websocket.close(code=1008, reason="Server at capacity")
+        logger.warning("[WS] Reject: capacity reached for user=%s", user_id)
+        await websocket.send_json({"type": "error", "error": "Server at capacity"})
+        # 1013 = Try Again Later (RFC 6455 recommended for temporary overload)
+        await websocket.close(code=1013, reason="Server at capacity")
         return
-    await websocket.accept()
+
+    # Mark that this user is now tracked
+    accepted_user = True
     fastapi_websocket_connections.inc()
 
+    logger.info("[WS] Accepted user=%s (%s)", user_id, websocket.client)
+
+    # ------------------------------------------------------------------
+    # Send welcome message
+    # ------------------------------------------------------------------
     welcome_msg = {
         "type": "connection",
         "status": "connected",
@@ -1469,26 +1521,39 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
     }
     await websocket.send_json(welcome_msg)
 
+    # ------------------------------------------------------------------
+    # Main receive / respond loop
+    # ------------------------------------------------------------------
     try:
         while True:
             data = await websocket.receive_json()
+
+            # --- client cancellation -------------------------------------------------
             if data.get("type") == "cancel_stream":
                 rid = data.get("request_id")
                 if rid:
                     cancelled = stream_manager.cancel_stream(rid)
-                    await websocket.send_json({"type": "stream_cancelled", "request_id": rid, "success": cancelled})
+                    await websocket.send_json(
+                        {"type": "stream_cancelled", "request_id": rid, "success": cancelled}
+                    )
                     logger.info(f"[WS] User {user_id} cancelled stream {rid}")
                 continue
+
+            # --- model availability --------------------------------------------------
             if llm is None and not UPSTREAM_URL:
                 await websocket.send_json({"type": "error", "error": "Model not loaded"})
                 continue
+
+            # --- rate limit ----------------------------------------------------------
             if not rate_limiter.check_rate_limit(user_id):
                 await websocket.send_json({"type": "error", "error": "Rate limit exceeded"})
                 continue
+
             try:
                 messages = [Message(**msg) for msg in data.get("messages", [])]
                 rid = data.get("request_id") or f"ws_{uuid.uuid4().hex[:8]}"
                 logger.info(f"[WS] User {user_id} stream {rid}: {len(messages)} messages")
+
                 prompt = format_messages_qwen(messages)
                 await websocket.send_json({"type": "stream_start", "request_id": rid})
 
@@ -1499,8 +1564,9 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                 cancelled = False
 
                 if UPSTREAM_URL:
-                    # Proxy mode: forward
+                    # Proxy mode: forward upstream streaming SSE -> token events
                     import httpx
+
                     headers = {"Authorization": f"Bearer {API_TOKEN}", "Content-Type": "application/json"}
                     payload = {
                         "model": data.get("model", "qwen2.5-32b"),
@@ -1512,18 +1578,26 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                         "stream": True,
                     }
                     async with httpx.AsyncClient(timeout=None) as client:
-                        async with client.stream("POST", f"{UPSTREAM_URL}/v1/chat/completions", headers=headers, json=payload) as r:
+                        async with client.stream(
+                            "POST",
+                            f"{UPSTREAM_URL}/v1/chat/completions",
+                            headers=headers,
+                            json=payload,
+                        ) as r:
                             async for line in r.aiter_lines():
                                 if not line:
                                     continue
                                 if line.startswith("data: "):
                                     if line.strip() == "data: [DONE]":
                                         break
-                                    # naive parse to get token? we'll just forward
-                                    await websocket.send_json({"type": "stream_token", "token": line, "request_id": rid})
+                                    # naive forward of entire line as a "token"
+                                    await websocket.send_json(
+                                        {"type": "stream_token", "token": line, "request_id": rid}
+                                    )
                                     tokens_count += 1
                                     full_response += line
                 else:
+                    # Local generation path
                     async for output in stream_manager.generate_async(
                         llm,
                         prompt,
@@ -1535,14 +1609,19 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                         top_k=data.get("top_k", 40),
                         stop=STOP_SEQS_DEFAULT,
                     ):
-                        token = output['choices'][0]['text']
+                        token = output["choices"][0]["text"]
                         full_response += token
                         tokens_count += 1
-                        if websocket.client_state.value != 1:  # disconnected
+
+                        # detect disconnect (state 1 == connected)
+                        if websocket.client_state.value != 1:
                             cancelled = True
                             break
+
                         try:
-                            await websocket.send_json({"type": "stream_token", "token": token, "request_id": rid})
+                            await websocket.send_json(
+                                {"type": "stream_token", "token": token, "request_id": rid}
+                            )
                         except Exception as e:  # pragma: no cover
                             logger.info(f"[WS] Send error for {user_id}: {e}")
                             cancelled = True
@@ -1550,6 +1629,7 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
 
                 duration = time.time() - start_ts
                 tps = tokens_count / duration if duration > 0 else 0
+
                 if websocket.client_state.value == 1:
                     try:
                         await websocket.send_json(
@@ -1565,27 +1645,34 @@ async def websocket_endpoint(websocket: WebSocket, token: str = Query(...)):
                         )
                     except Exception:  # pragma: no cover
                         pass
+
                 logger.info(
-                    f"[WS] User {user_id} stream {rid}: {tokens_count} tokens in {duration:.2f}s ({tps:.1f} tps, cancelled={cancelled})"
+                    f"[WS] User {user_id} stream {rid}: {tokens_count} tokens in {duration:.2f}s "
+                    f"({tps:.1f} tps, cancelled={cancelled})"
                 )
                 fastapi_inference_requests_total.labels(
                     model="qwen2.5-32b-q6k", status="cancelled" if cancelled else "success"
                 ).inc()
+
             except Exception as e:  # pragma: no cover
                 logger.error(f"[WS] Error for {user_id}: {e}", exc_info=True)
                 if websocket.client_state.value == 1:
                     try:
-                        await websocket.send_json({"type": "error", "error": str(e), "request_id": data.get("request_id")})
+                        await websocket.send_json(
+                            {"type": "error", "error": str(e), "request_id": data.get("request_id")}
+                        )
                     except Exception:
                         pass
+
     except WebSocketDisconnect:
         logger.info(f"[WS] User {user_id} disconnected")
     finally:
-        fastapi_websocket_connections.dec()
-        stream_manager.resource_manager.active_users.discard(user_id)
-        fastapi_concurrent_users.set(len(stream_manager.resource_manager.active_users))
-
-
+        if accepted_user:
+            fastapi_websocket_connections.dec()
+            # remove user from active_users set
+            stream_manager.resource_manager.active_users.discard(user_id)
+            fastapi_concurrent_users.set(len(stream_manager.resource_manager.active_users))
+            
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
