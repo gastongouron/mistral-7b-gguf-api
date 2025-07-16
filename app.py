@@ -935,26 +935,37 @@ def load_model() -> None:
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
-def lifespan(app: FastAPI):
-    print("=== Starting FastAPI Proxy Application ===")
-    # background metrics
+async def lifespan(app: FastAPI):
+    """Gestion du cycle de vie de l'application."""
+    print("=== Starting FastAPI Application ===")
+
+    # Démarrer les tâches de métriques périodiques
     metrics_task = asyncio.create_task(metrics_update_task())
+
+    # Charger le modèle (synchrone)
     try:
         load_model()
-        print("=== Model (or proxy) ready ===")
-    except Exception as e:  # pragma: no cover
+        print("=== Model loaded, API ready ===")
+    except Exception as e:
         print(f"Fatal error loading model: {e}")
         model_loaded.set(0)
-    yield
-    print("=== Shutting down ===")
-    model_loaded.set(0)
-    metrics_task.cancel()
+
+    # Laisser tourner l'application
     try:
-        await metrics_task
-    except asyncio.CancelledError:
-        pass
-    # close executor
-    stream_manager.executor.shutdown(wait=True)
+        yield
+    finally:
+        print("=== Shutting down ===")
+        model_loaded.set(0)
+
+        # Arrêter la tâche de métriques
+        metrics_task.cancel()
+        try:
+            await metrics_task
+        except asyncio.CancelledError:
+            pass
+
+        # Fermer le threadpool de streaming
+        stream_manager.executor.shutdown(wait=True)
 
 
 # ---------------------------------------------------------------------------
