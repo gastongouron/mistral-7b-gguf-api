@@ -10,7 +10,7 @@ import sys
 from datetime import datetime
 
 # Configuration
-POD_ID = "0g1yim1q032z3x"
+POD_ID = "6owx2sl5ef6dcy"
 API_URL = f"https://{POD_ID}-8000.proxy.runpod.net"
 API_TOKEN = "supersecret"
 

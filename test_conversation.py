@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import List, Dict, Optional
 
 # Configuration
-POD_ID = "0g1yim1q032z3x"
+POD_ID = "6owx2sl5ef6dcy"
 WS_URL = f"wss://{POD_ID}-8000.proxy.runpod.net/ws"
 API_TOKEN = "supersecret"
 

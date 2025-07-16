@@ -134,6 +134,16 @@ from prometheus_client import (
     CONTENT_TYPE_LATEST,
 )
 
+from starlette.concurrency import run_in_threadpool   # nouveau
+
+_LLAMA_ALLOWED_KW = {
+    "max_tokens", "temperature", "top_p", "top_k",
+    "stop", "repeat_penalty", "logprobs", "logits_all",
+    "echo", "tfs_z", "typical_p", "presence_penalty",
+    "frequency_penalty", "mirostat_mode", "mirostat_tau",
+    "mirostat_eta", "grammar", "n_keep", "stream",
+}
+
 # ---------------------------------------------------------------------------
 # Configuration via environnement
 # ---------------------------------------------------------------------------
@@ -1118,16 +1128,18 @@ STOP_SEQS_DEFAULT = ["<|im_end|>", "<|im_start|>", "<|endoftext|>"]
 async def _run_llm_nonstream(prompt: str, **gen_kwargs) -> Dict[str, Any]:
     if llm is None and not UPSTREAM_URL:
         raise HTTPException(status_code=503, detail="Model not loaded")
-    if UPSTREAM_URL:  # proxy
+
+    # ❶ Nettoyage : on garde seulement ce que Llama accepte
+    safe_kwargs = {k: v for k, v in gen_kwargs.items() if k in _LLAMA_ALLOWED_KW}
+
+    # ❷ Proxy amont éventuel
+    if UPSTREAM_URL:
         import httpx
         headers = {"Authorization": f"Bearer {API_TOKEN}", "Content-Type": "application/json"}
         payload = {
-            "model": gen_kwargs.pop("model_name", "qwen2.5-32b-q6k"),
-            "messages": gen_kwargs.pop("messages_payload", []),
-            "temperature": gen_kwargs.get("temperature", 0.1),
-            "max_tokens": gen_kwargs.get("max_tokens", 200),
-            "top_p": gen_kwargs.get("top_p", 0.9),
-            "top_k": gen_kwargs.get("top_k", 40),
+            "model": safe_kwargs.pop("model", "qwen2.5-32b"),
+            "messages": gen_kwargs.get("messages_payload", []),
+            **safe_kwargs,
             "stream": False,
         }
         r = await proxy_upstream("POST", "/v1/chat/completions", headers=headers, json=payload)
@@ -1135,16 +1147,15 @@ async def _run_llm_nonstream(prompt: str, **gen_kwargs) -> Dict[str, Any]:
             raise HTTPException(status_code=r.status_code, detail=r.text)
         return r.json()
 
-    # local path
-    # Acquire semaphore (same que streaming)
+    # ❸ Sémaphore GPU : garantie de non-concurrence
     queue_size = MAX_PARALLEL_INFER - stream_manager.model_semaphore._value
     fastapi_inference_queue_size.set(max(queue_size, 0))
     await stream_manager.model_semaphore.acquire()
     fastapi_inference_queue_size.set(max(queue_size - 1, 0))
 
     try:
-        out = llm(prompt, **gen_kwargs)
-        return out
+        # ❹ Appel bloquant → threadpool (event-loop libre)
+        return await run_in_threadpool(llm, prompt, **safe_kwargs)
     finally:
         stream_manager.model_semaphore.release()
 
